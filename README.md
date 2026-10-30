@@ -12,6 +12,38 @@
 ![](docs/boltz1_pred_figure.png)
 
 
+## About this fork: local MSA generation
+
+This is a fork of [Boltz](https://github.com/jwohlwend/boltz) 2.2.1 that adds one feature: **generating MSAs locally with MMseqs2 on the GPU**, instead of sending sequences to the public ColabFold server.
+
+```
+boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/mmseqs_databases
+```
+
+- **Private:** sequences never leave your machine.
+- **Batched and cached:** all proteins across all inputs are searched together, and each sequence's MSA is cached, so a protein shared by many complexes is searched once.
+- **Same MSAs as AlphaFold3:** it searches UniRef90, Small BFD, MGnify and UniProt with the same settings as [AlphaFast](https://github.com/RomeroLab/alphafast). UniProt hits are keyed by species so Boltz can pair chains.
+
+You need an MMseqs2 build with GPU support and the four databases in MMseqs2 padded format (about 390 GB; AlphaFast's database setup script builds them). Setup, options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md). Everything else works exactly as in upstream Boltz, and the rest of this README is upstream's.
+
+### Installing this fork
+
+```
+git clone https://github.com/martien2kk/boltz2_local_mmseq2.git
+cd boltz2_local_mmseq2
+pip install -e .[cuda]
+```
+
+On NVIDIA Blackwell GPUs (RTX 50 series, RTX PRO 6000/4500 Blackwell, B200), install a PyTorch build for CUDA 12.8 or newer **first**, so the step above doesn't replace it with one that lacks Blackwell support:
+
+```
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -e .[cuda]
+```
+
+To check the feature, run `python -m pytest tests/test_local_msa.py`. Set `BOLTZ_MMSEQS_DB_DIR` to also run a real search.
+
+
 ## Introduction
 
 Boltz is a family of models for biomolecular interaction prediction. Boltz-1 was the first fully open source model to approach AlphaFold3 accuracy. Our latest work Boltz-2 is a new biomolecular foundation model that goes beyond AlphaFold3 and Boltz-1 by jointly modeling complex structures and binding affinities, a critical component towards accurate molecular design. Boltz-2 is the first deep learning model to approach the accuracy of physics-based free-energy perturbation (FEP) methods, while running 1000x faster — making accurate in silico screening practical for early-stage drug discovery.

@@ -164,3 +164,9 @@ cython_debug/
 # Boltz prediction outputs
 #   All result files generated from a boltz prediction call
 boltz_results_*/
+
+# Local MSA generation
+#   MSA caches and MMseqs2 binaries (large, and not ours to redistribute)
+msa_cache/
+mmseqs
+mmseqs-linux-*.tar.gz

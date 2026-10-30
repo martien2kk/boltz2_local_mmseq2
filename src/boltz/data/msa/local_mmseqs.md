@@ -6,7 +6,7 @@
 
 - **Privacy.** `--use_msa_server` sends sequences to `api.colabfold.com`. A local search sends nothing.
 - **Speed at scale.** Many sequences are searched together in one GPU pass per database, and every result is cached. A protein used in 100 complexes is searched once.
-- **Same MSAs as AlphaFold3.** The search settings match AlphaFast's MMseqs2-GPU defaults, so Boltz sees the same evolutionary information as an AF3 run on the same databases.
+- **Same MSAs as AlphaFold3.** The search settings match [AlphaFast](https://github.com/RomeroLab/alphafast)'s MMseqs2-GPU defaults, so Boltz sees the same evolutionary information as an AF3 run on the same databases.
 
 ## Requirements
 
@@ -20,7 +20,7 @@ mmseqs search -h | grep -- "--gpu "
 
 Options:
 
-- Download the GPU build from the MMseqs2 releases (`mmseqs-linux-gpu.tar.gz`).
+- Download the GPU build (`mmseqs-linux-gpu.tar.gz`) from the [MMseqs2](https://github.com/soedinglab/MMseqs2) releases.
 - If you use AlphaFast, copy the binary out of its container. It is self-contained:
   ```bash
   singularity exec alphafast.sif cat /usr/local/bin/mmseqs > $CONDA_PREFIX/bin/mmseqs
