@@ -1,17 +1,3 @@
-<div align="center">
-  <div>&nbsp;</div>
-  <img src="docs/boltz2_title.png" width="300"/>
-  <img src="https://model-gateway.boltz.bio/a.png?x-pxid=bce1627f-f326-4bff-8a97-45c6c3bc929d" />
-
-[Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://doi.org/10.1101/2025.06.14.659707) |
-[Slack](https://boltz.bio/join-slack) <br> <br>
-</div>
-
-
-
-![](docs/boltz1_pred_figure.png)
-
-
 ## About this fork: local MSA generation
 
 This is a fork of [Boltz](https://github.com/jwohlwend/boltz) 2.2.1 that adds one feature: **generating MSAs locally with MMseqs2 on the GPU**, instead of sending sequences to the public ColabFold server.
@@ -42,6 +28,20 @@ pip install -e .[cuda]
 ```
 
 To check the feature, run `python -m pytest tests/test_local_msa.py`. Set `BOLTZ_MMSEQS_DB_DIR` to also run a real search.
+
+
+<div align="center">
+  <div>&nbsp;</div>
+  <img src="docs/boltz2_title.png" width="300"/>
+  <img src="https://model-gateway.boltz.bio/a.png?x-pxid=bce1627f-f326-4bff-8a97-45c6c3bc929d" />
+
+[Boltz-1](https://doi.org/10.1101/2024.11.19.624167) | [Boltz-2](https://doi.org/10.1101/2025.06.14.659707) |
+[Slack](https://boltz.bio/join-slack) <br> <br>
+</div>
+
+
+
+![](docs/boltz1_pred_figure.png)
 
 
 ## Introduction
