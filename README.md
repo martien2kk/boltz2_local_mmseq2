@@ -10,7 +10,35 @@ boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/mmseqs_databas
 - **Batched and cached:** all proteins across all inputs are searched together, and each sequence's MSA is cached, so a protein shared by many complexes is searched once.
 - **Same MSAs as AlphaFold3:** it searches UniRef90, Small BFD, MGnify and UniProt with the same settings as [AlphaFast](https://github.com/RomeroLab/alphafast). UniProt hits are keyed by species so Boltz can pair chains.
 
-You need an MMseqs2 build with GPU support and the four databases in MMseqs2 padded format (about 390 GB; AlphaFast's database setup script builds them). Setup, options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md). Everything else works exactly as in upstream Boltz, and the rest of this README is upstream's.
+Options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md). Everything else works exactly as in upstream Boltz, and the rest of this README is upstream's.
+
+### Requirements
+
+**1. MMseqs2 with GPU support.** Either:
+
+- Download the GPU build (`mmseqs-linux-gpu.tar.gz`) from the [MMseqs2 releases](https://github.com/soedinglab/MMseqs2/releases) and put `mmseqs` on your `PATH`.
+- Or, if you use [AlphaFast](https://github.com/RomeroLab/alphafast), copy the binary out of its official container. It is self-contained, and it is the build that created AlphaFast's databases:
+
+  ```
+  singularity pull alphafast.sif docker://romerolabduke/alphafast:latest
+  singularity exec alphafast.sif cat /usr/local/bin/mmseqs > $CONDA_PREFIX/bin/mmseqs
+  chmod +x $CONDA_PREFIX/bin/mmseqs
+  mmseqs search -h | grep -- "--gpu "    # should list the --gpu option
+  ```
+
+Use the same MMseqs2 build that created your databases where possible, since the padded database format can change between versions. This fork was tested with MMseqs2 `d45e0c44404715475da3e1f06df6529d4c83e49e` from AlphaFast's container.
+
+**2. The databases.** UniRef90, Small BFD, MGnify and UniProt in MMseqs2 padded format, in one folder (about 390 GB). AlphaFast's setup script downloads them prebuilt:
+
+```
+git clone https://github.com/RomeroLab/alphafast.git
+./alphafast/scripts/setup_databases.sh /path/to/databases --protein-only
+boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/databases/mmseqs
+```
+
+The script needs about 800 GB of free disk space while it runs. See AlphaFast's README for options, including building the databases from source.
+
+**Third-party software and data.** This repository contains only Boltz and the local MSA code, under the MIT license. MMseqs2, the AlphaFast container and scripts, and the sequence databases are not included or redistributed here. Each is downloaded from its own source and has its own license and terms. Notably, AlphaFast is licensed CC-BY-NC-SA 4.0 (non-commercial), so check those terms before using its container or scripts for commercial work.
 
 ### Installing this fork
 
