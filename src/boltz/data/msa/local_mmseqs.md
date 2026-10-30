@@ -44,6 +44,32 @@ AlphaFast's `scripts/setup_databases.sh` builds exactly this layout (its `mmseqs
 
 ## Usage
 
+### From the command line
+
+```bash
+boltz predict job.yaml --use_local_msa --mmseqs_db_dir /opt/AlphaFast/mmseqs --out_dir results/
+```
+
+This works like `--use_msa_server`: every protein without an `msa:` field gets one generated, but locally. All such sequences across all inputs are searched together before preprocessing starts. Each job's `msa/` output folder gets a copy of its CSVs.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--use_local_msa` | off | Turn on local MSA generation |
+| `--mmseqs_db_dir` | `$BOLTZ_MMSEQS_DB_DIR` | Folder with the four padded databases (required) |
+| `--mmseqs_binary` | `mmseqs` | MMseqs2 binary name or path |
+| `--msa_cache_dir` | `<cache>/msa_cache` (`~/.boltz/msa_cache`) | Where finished CSVs are stored |
+| `--mmseqs_sensitivity` | 7.5 | MMseqs2 `-s` |
+| `--max_paired_msa_rows` | 4096 | Cap on taxonomy-keyed rows (see below) |
+
+`--use_local_msa` cannot be combined with `--use_msa_server`. Setting the database folder once in your shell saves typing:
+
+```bash
+export BOLTZ_MMSEQS_DB_DIR=/opt/AlphaFast/mmseqs
+boltz predict job.yaml --use_local_msa --out_dir results/
+```
+
+### From Python
+
 ```python
 from boltz.data.msa.local_mmseqs import search_sequences
 

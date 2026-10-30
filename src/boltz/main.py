@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import pickle
 import platform
+import shutil
 import tarfile
 import urllib.request
 import warnings
@@ -23,6 +24,11 @@ from boltz.data import const
 from boltz.data.module.inference import BoltzInferenceDataModule
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.mol import load_canonicals
+from boltz.data.msa.local_mmseqs import (
+    cached_msa_path,
+    collect_sequences,
+    search_sequences,
+)
 from boltz.data.msa.mmseqs2 import run_mmseqs2
 from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.csv import parse_csv
@@ -542,6 +548,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     processed_mols_dir: Path,
     structure_dir: Path,
     records_dir: Path,
+    local_msa: Optional[dict] = None,
 ) -> None:
     try:
         # Parse data
@@ -578,11 +585,20 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
                 chain.msa_id = -1
 
         # Generate MSA
-        if to_generate and not use_msa_server:
-            msg = "Missing MSA's in input and --use_msa_server flag not set."
+        if to_generate and not use_msa_server and local_msa is None:
+            msg = (
+                "Missing MSA's in input and neither --use_msa_server "
+                "nor --use_local_msa is set."
+            )
             raise RuntimeError(msg)  # noqa: TRY301
 
-        if to_generate:
+        if to_generate and local_msa is not None:
+            # Cached by predict() for all inputs at once; searched here if missing
+            cached = search_sequences(list(to_generate.values()), **local_msa)
+            for msa_id, sequence in to_generate.items():
+                shutil.copyfile(cached[sequence], msa_dir / f"{msa_id}.csv")
+
+        elif to_generate:
             msg = f"Generating MSA for {path} with {len(to_generate)} protein entities."
             click.echo(msg)
             compute_msa(
@@ -677,6 +693,7 @@ def process_inputs(
     api_key_value: Optional[str] = None,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
+    local_msa: Optional[dict] = None,
 ) -> Manifest:
     """Process the input data and output directory.
 
@@ -704,6 +721,9 @@ def process_inputs(
         Whether to use Boltz2, by default False.
     preprocessing_threads: int, optional
         The number of threads to use for preprocessing, by default 1.
+    local_msa: dict, optional
+        Keyword arguments for local_mmseqs.search_sequences. When set, missing
+        MSAs are generated locally instead of with the MSA server.
 
     Returns
     -------
@@ -768,6 +788,20 @@ def process_inputs(
         with ccd_path.open("rb") as file:
             ccd = pickle.load(file)  # noqa: S301
 
+    # Search all missing MSAs together, one MMseqs2 run per database
+    if local_msa is not None:
+        sequences = collect_sequences(data)
+        new = [
+            s for s in sequences
+            if not cached_msa_path(local_msa["cache_dir"], s).exists()
+        ]
+        click.echo(
+            f"Local MSAs for {len(sequences)} protein sequence(s): "
+            f"{len(sequences) - len(new)} cached, {len(new)} to search "
+            f"(cache: {local_msa['cache_dir']})."
+        )
+        search_sequences(sequences, **local_msa)
+
     # Create partial function
     process_input_partial = partial(
         process_input,
@@ -789,6 +823,7 @@ def process_inputs(
         processed_mols_dir=processed_mols_dir,
         structure_dir=structure_dir,
         records_dir=records_dir,
+        local_msa=local_msa,
     )
 
     # Parse input data
@@ -966,6 +1001,55 @@ def cli() -> None:
     default=None,
 )
 @click.option(
+    "--use_local_msa",
+    is_flag=True,
+    help=(
+        "Whether to generate MSAs locally with MMseqs2 instead of the MSA server. "
+        "Requires --mmseqs_db_dir. Default is False."
+    ),
+)
+@click.option(
+    "--mmseqs_db_dir",
+    type=click.Path(exists=True, file_okay=False),
+    envvar="BOLTZ_MMSEQS_DB_DIR",
+    help=(
+        "Directory with uniref90, small_bfd, mgnify and uniprot MMseqs2 padded "
+        "databases. Used only if --use_local_msa is set. Can also be set via "
+        "BOLTZ_MMSEQS_DB_DIR environment variable."
+    ),
+    default=None,
+)
+@click.option(
+    "--mmseqs_binary",
+    type=str,
+    help="MMseqs2 binary name or path. Used only if --use_local_msa is set. Default is mmseqs.",
+    default="mmseqs",
+)
+@click.option(
+    "--msa_cache_dir",
+    type=click.Path(),
+    help=(
+        "Where locally generated MSAs are cached. Used only if --use_local_msa "
+        "is set. Default is <cache>/msa_cache."
+    ),
+    default=None,
+)
+@click.option(
+    "--mmseqs_sensitivity",
+    type=float,
+    help="MMseqs2 search sensitivity (-s). Used only if --use_local_msa is set. Default is 7.5.",
+    default=7.5,
+)
+@click.option(
+    "--max_paired_msa_rows",
+    type=int,
+    help=(
+        "Maximum taxonomy-keyed rows per local MSA, used for chain pairing. "
+        "Used only if --use_local_msa is set. Default is 4096."
+    ),
+    default=4096,
+)
+@click.option(
     "--use_potentials",
     is_flag=True,
     help="Whether to use potentials for steering. Default is False.",
@@ -1067,6 +1151,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     msa_server_password: Optional[str] = None,
     api_key_header: Optional[str] = None,
     api_key_value: Optional[str] = None,
+    use_local_msa: bool = False,
+    mmseqs_db_dir: Optional[str] = None,
+    mmseqs_binary: str = "mmseqs",
+    msa_cache_dir: Optional[str] = None,
+    mmseqs_sensitivity: float = 7.5,
+    max_paired_msa_rows: int = 4096,
     use_potentials: bool = False,
     model: Literal["boltz1", "boltz2"] = "boltz2",
     method: Optional[str] = None,
@@ -1128,6 +1218,24 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         else:
             click.echo("MSA server authentication: no credentials provided")
 
+    # Set up local MSA generation
+    local_msa = None
+    if use_local_msa:
+        if use_msa_server:
+            msg = "Use either --use_msa_server or --use_local_msa, not both."
+            raise click.UsageError(msg)
+        if mmseqs_db_dir is None:
+            msg = "--use_local_msa requires --mmseqs_db_dir (or BOLTZ_MMSEQS_DB_DIR)."
+            raise click.UsageError(msg)
+        local_msa = {
+            "db_dir": Path(mmseqs_db_dir).expanduser(),
+            "cache_dir": Path(msa_cache_dir or cache / "msa_cache").expanduser(),
+            "mmseqs": mmseqs_binary,
+            "sensitivity": mmseqs_sensitivity,
+            "max_paired_rows": max_paired_msa_rows,
+        }
+        click.echo(f"Local MSA generation enabled: {local_msa['db_dir']}")
+
     # Create output directories
     data = Path(data).expanduser()
     out_dir = Path(out_dir).expanduser()
@@ -1174,6 +1282,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         boltz2=model == "boltz2",
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
+        local_msa=local_msa,
     )
 
     # Load manifest

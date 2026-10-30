@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 # Database name -> maximum hits kept per query
@@ -40,6 +42,42 @@ def sequence_id(sequence: str) -> str:
 def cached_msa_path(cache_dir: Path, sequence: str) -> Path:
     """Return the cache location of a sequence's MSA CSV."""
     return Path(cache_dir) / f"{sequence_id(sequence)}.csv"
+
+
+def collect_sequences(paths: list[Path]) -> list[str]:
+    """Find protein sequences that need a generated MSA in Boltz inputs.
+
+    A protein needs one when its MSA is unset, as in Boltz's own parsing:
+    no msa field (or null / "" / 0) in YAML, or no MSA path in a FASTA header.
+
+    Parameters
+    ----------
+    paths : list[Path]
+        Boltz input files (.yaml, .yml, .fasta, .fa, .fas).
+
+    Returns
+    -------
+    list[str]
+        Unique sequences, in order of first appearance.
+
+    """
+    sequences = []
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix in (".yml", ".yaml"):
+            with path.open() as f:
+                doc = yaml.safe_load(f)
+            for entry in doc.get("sequences", []):
+                protein = entry.get("protein")
+                if protein and protein.get("msa") in (None, "", 0):
+                    sequences.append(str(protein["sequence"]))
+        elif suffix in (".fa", ".fas", ".fasta"):
+            for header, seq in read_fasta(path.read_text()):
+                fields = header.split()[0].split("|")
+                is_protein = len(fields) >= 2 and fields[1].lower() == "protein"
+                if is_protein and (len(fields) < 3 or fields[2] == ""):
+                    sequences.append(seq)
+    return list(dict.fromkeys(sequences))
 
 
 def check_setup(db_dir: Path, mmseqs: str) -> str:
