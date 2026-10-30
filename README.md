@@ -36,9 +36,9 @@ git clone https://github.com/RomeroLab/alphafast.git
 boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/databases/mmseqs
 ```
 
-The script needs about 800 GB of free disk space while it runs. See AlphaFast's README for options, including building the databases from source.
+The script needs about 800 GB of free disk space while it runs. See [AlphaFast's database instructions](https://github.com/RomeroLab/alphafast#step-3-download-and-convert-databases) for options, including building the databases from source.
 
-**Third-party software and data.** This repository contains only Boltz and the local MSA code, under the MIT license. MMseqs2, the AlphaFast container and scripts, and the sequence databases are not included or redistributed here. Each is downloaded from its own source and has its own license and terms. Notably, AlphaFast is licensed CC-BY-NC-SA 4.0 (non-commercial), so check those terms before using its container or scripts for commercial work.
+**Third-party software and data.** This repository contains only Boltz and the local MSA code, under the MIT license. MMseqs2, the AlphaFast container and scripts, and the sequence databases are not included or redistributed here. Each is downloaded from its own source and has its own license and terms. Notably, AlphaFast is licensed [CC-BY-NC-SA 4.0](https://github.com/RomeroLab/alphafast/blob/main/LICENSE) (non-commercial), so check those terms before using its container or scripts for commercial work.
 
 ### Installing this fork
 
