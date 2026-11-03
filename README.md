@@ -2,7 +2,9 @@
 
 A fork of [Boltz](https://github.com/jwohlwend/boltz) 2.2.1 that adds one feature: **generating MSAs locally with MMseqs2 on the GPU**, instead of sending sequences to the public ColabFold server.
 
-Everything else is unchanged. For the model itself, inference options, affinity prediction, training, evaluation, licensing and citation, see the [upstream Boltz README](https://github.com/jwohlwend/boltz/blob/main/README.md).
+Boltz needs a multiple sequence alignment for every protein chain, and building those alignments is usually the slowest part of a prediction. Upstream gives you two ways to get them: precompute them yourself and pass them in, or use `--use_msa_server` and let the public ColabFold server build them, which means queueing behind other users and sending your sequences off your machine.
+
+This fork adds a third. Point it at your own copies of the databases and it searches them with MMseqs2 on the GPU, as part of the usual prediction run:
 
 ```
 boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/mmseqs_databases
@@ -12,7 +14,7 @@ boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/mmseqs_databas
 - **Batched and cached:** all proteins across all inputs are searched together, and each sequence's MSA is cached, so a protein shared by many complexes is searched once.
 - **Same MSAs as AlphaFold3:** it searches UniRef90, Small BFD, MGnify and UniProt with the same settings as [AlphaFast](https://github.com/RomeroLab/alphafast). UniProt hits are keyed by species so Boltz can pair chains.
 
-Options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md).
+Options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md). Everything else is unchanged: for the model itself, inference options, affinity prediction, training, evaluation, licensing and citation, see the [upstream Boltz README](https://github.com/jwohlwend/boltz/blob/main/README.md).
 
 ## Requirements
 
