@@ -7,8 +7,10 @@ defaults, so MSAs match those used for AlphaFold3 runs on the same databases.
 
 Each CSV holds the query, then UniProt hits keyed by NCBI taxonomy id (Boltz
 pairs rows across chains that share a key), then UniRef90, Small BFD and
-MGnify hits with key -1 (unpaired). CSVs are cached by sequence hash, so a
-sequence is only ever searched once.
+MGnify hits with key -1 (unpaired). CSVs are named by sequence hash, so a
+sequence shared by several inputs is searched once per run. Boltz points
+cache_dir at a directory that lives only for the run, so nothing persists
+between runs; pass a lasting path yourself to reuse MSAs across runs.
 """
 
 import hashlib

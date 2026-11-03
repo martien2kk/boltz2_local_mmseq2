@@ -5,7 +5,7 @@
 ## Why use it
 
 - **Privacy.** `--use_msa_server` sends sequences to `api.colabfold.com`. A local search sends nothing.
-- **Speed at scale.** Many sequences are searched together in one GPU pass per database, and every result is cached. A protein used in 100 complexes is searched once.
+- **Speed at scale.** Many sequences are searched together in one GPU pass per database, and identical sequences are collapsed first. A protein used in 100 complexes in one run is searched once.
 - **Same MSAs as AlphaFold3.** The search settings match [AlphaFast](https://github.com/RomeroLab/alphafast)'s MMseqs2-GPU defaults, so Boltz sees the same evolutionary information as an AF3 run on the same databases.
 
 ## Requirements
@@ -50,14 +50,15 @@ AlphaFast's `scripts/setup_databases.sh` builds exactly this layout (its `mmseqs
 boltz predict job.yaml --use_local_msa --mmseqs_db_dir /opt/AlphaFast/mmseqs --out_dir results/
 ```
 
-This works like `--use_msa_server`: every protein without an `msa:` field gets one generated, but locally. All such sequences across all inputs are searched together before preprocessing starts. Each job's `msa/` output folder gets a copy of its CSVs.
+This works like `--use_msa_server`: every protein without an `msa:` field gets one generated, but locally. All such sequences across all inputs are deduplicated and searched together before preprocessing starts. Each job's `msa/` output folder gets a copy of its CSVs.
+
+The search results live in a temporary folder for the duration of the run and are deleted when it ends, so a run depends only on its inputs and the databases. To reuse MSAs across runs, keep the CSVs from a job's `msa/` folder and reference them with `msa:` in your YAML, or call `search_sequences` yourself with a lasting `cache_dir` (see [From Python](#from-python)).
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--use_local_msa` | off | Turn on local MSA generation |
 | `--mmseqs_db_dir` | `$BOLTZ_MMSEQS_DB_DIR` | Folder with the four padded databases (required) |
 | `--mmseqs_binary` | `mmseqs` | MMseqs2 binary name or path |
-| `--msa_cache_dir` | `<cache>/msa_cache` (`~/.boltz/msa_cache`) | Where finished CSVs are stored |
 | `--mmseqs_sensitivity` | 7.5 | MMseqs2 `-s` |
 | `--max_paired_msa_rows` | 4096 | Cap on taxonomy-keyed rows (see below) |
 
@@ -76,10 +77,12 @@ from boltz.data.msa.local_mmseqs import search_sequences
 paths = search_sequences(
     sequences=["MKTAYIAKQR...", "GSHMSLFDFF..."],
     db_dir="/opt/AlphaFast/mmseqs",
-    cache_dir="~/.boltz/msa_cache",
+    cache_dir="~/my_msas",
 )
 # {"MKTAYIAKQR...": PosixPath(".../<hash>.csv"), ...}
 ```
+
+Unlike `boltz predict`, this writes to the directory you name and leaves the CSVs there. Call it again with the same `cache_dir` and sequences already present are returned without being searched again — this is how to build MSAs once and reuse them.
 
 Each returned CSV can be used directly in a Boltz YAML:
 
@@ -88,7 +91,7 @@ sequences:
   - protein:
       id: A
       sequence: MKTAYIAKQR...
-      msa: /home/me/.boltz/msa_cache/<hash>.csv
+      msa: /home/me/my_msas/<hash>.csv
 ```
 
 `mmseqs` must be on `PATH` (for example, with the conda env activated), or passed as `mmseqs="/path/to/mmseqs"`.
@@ -96,13 +99,13 @@ sequences:
 ## How it works
 
 ```
-sequences ─► skip any already in the cache
+sequences ─► drop duplicates, and any already written in this run
           ─► mmseqs createdb                        (all new sequences, one query DB)
           ─► for each of uniref90, small_bfd, mgnify, uniprot:
                mmseqs search -a --gpu 1             (find and align hits)
                mmseqs result2msa --msa-format-mode 2 (aligned FASTA, headers kept)
                mmseqs unpackdb                      (one file per query)
-          ─► combine rows per sequence ─► <cache>/<sha256>.csv
+          ─► combine rows per sequence ─► <cache_dir>/<sha256>.csv
 ```
 
 `--msa-format-mode 2` writes every row at the query's length, with insertions removed. Boltz reads that directly, so no further alignment step is needed.
@@ -148,11 +151,12 @@ Duplicate sequences are dropped, keeping the first copy. Boltz itself keeps only
 
 **Why cap the keyed rows?** At prediction time Boltz reads only the first `--max_msa_seqs` rows (default 8,192). UniProt can return up to 50,000 hits, and without a cap they would fill that whole window and push out every unpaired hit. With the default cap, at most half of the default window is keyed rows.
 
-## Caching
+## Deduplication
 
-- Each CSV is named by the first 24 hex characters of the sequence's SHA-256. Identical sequences share one file, whatever chain or job they come from.
-- A CSV is written to a temporary name and renamed when complete, so an interrupted run never leaves a partial file in the cache.
-- To redo a search (for example, after changing settings or updating databases), delete the CSV, or the whole cache folder.
+- Each CSV is named by the first 24 hex characters of the sequence's SHA-256. Identical sequences share one file, whatever chain or input they come from, so a receptor repeated across many complexes is searched once per run.
+- `boltz predict` points `cache_dir` at a temporary folder that is removed when the run ends. Nothing persists between runs, and no state outside the output directory affects a run's result.
+- `search_sequences` itself will reuse whatever is already in the `cache_dir` it is given. Pass a lasting path when calling it from Python and it behaves as a cache across calls.
+- A CSV is written to a temporary name and renamed when complete, so an interrupted run never leaves a partial file behind. Note that the temporary name is derived from the final one, so two processes writing the *same* sequence into the *same* directory at once can race; give concurrent jobs separate directories.
 
 ## Example: PDB 7KFK (LILRB1 + RIFIN)
 
@@ -163,7 +167,7 @@ Run on one RTX PRO 4500 Blackwell (32 GB) against the AlphaFast databases:
 | LILRB1 D1–D2 | 233 | 8,310 | 4,096 (capped) |
 | RIFIN | 151 | 296 | 282 |
 
-The search took 236 s for both sequences. A repeat call returned instantly from the cache. The RIFIN MSA was identical in size to AlphaFast's. The LILRB1 MSA differs only by the keyed-row cap.
+The search took 236 s for both sequences. A repeat `search_sequences` call with the same `cache_dir` returned instantly. The RIFIN MSA was identical in size to AlphaFast's. The LILRB1 MSA differs only by the keyed-row cap.
 
 ## Limitations
 

@@ -11,7 +11,7 @@ boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/mmseqs_databas
 ```
 
 - **Private:** sequences never leave your machine.
-- **Batched and cached:** all proteins across all inputs are searched together, and each sequence's MSA is cached, so a protein shared by many complexes is searched once.
+- **Batched:** all proteins across all inputs are deduplicated and searched together, so a protein shared by many complexes is searched once. Results live in a temporary folder for the run and are deleted afterwards, so a run depends only on its inputs and the databases.
 - **Same MSAs as AlphaFold3:** it searches UniRef90, Small BFD, MGnify and UniProt with the same settings as [AlphaFast](https://github.com/RomeroLab/alphafast). UniProt hits are keyed by species so Boltz can pair chains.
 
 Options and details are in [src/boltz/data/msa/local_mmseqs.md](src/boltz/data/msa/local_mmseqs.md). Everything else is unchanged: for the model itself, inference options, affinity prediction, training, evaluation, licensing and citation, see the [upstream Boltz README](https://github.com/jwohlwend/boltz/blob/main/README.md).

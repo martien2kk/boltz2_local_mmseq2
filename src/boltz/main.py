@@ -4,6 +4,7 @@ import pickle
 import platform
 import shutil
 import tarfile
+import tempfile
 import urllib.request
 import warnings
 from dataclasses import asdict, dataclass
@@ -25,7 +26,6 @@ from boltz.data.module.inference import BoltzInferenceDataModule
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.mol import load_canonicals
 from boltz.data.msa.local_mmseqs import (
-    cached_msa_path,
     collect_sequences,
     search_sequences,
 )
@@ -788,17 +788,16 @@ def process_inputs(
         with ccd_path.open("rb") as file:
             ccd = pickle.load(file)  # noqa: S301
 
-    # Search all missing MSAs together, one MMseqs2 run per database
+    # Search all MSAs together, one MMseqs2 run per database. They are written
+    # to a directory that lives only for this run: each unique sequence is
+    # searched once here, and nothing is kept once the run is over.
+    msa_tmp = None
     if local_msa is not None:
+        msa_tmp = tempfile.TemporaryDirectory(prefix="boltz_msa_")
+        local_msa = {**local_msa, "cache_dir": Path(msa_tmp.name)}
         sequences = collect_sequences(data)
-        new = [
-            s for s in sequences
-            if not cached_msa_path(local_msa["cache_dir"], s).exists()
-        ]
         click.echo(
-            f"Local MSAs for {len(sequences)} protein sequence(s): "
-            f"{len(sequences) - len(new)} cached, {len(new)} to search "
-            f"(cache: {local_msa['cache_dir']})."
+            f"Local MSAs: {len(sequences)} unique protein sequence(s) to search."
         )
         search_sequences(sequences, **local_msa)
 
@@ -836,6 +835,11 @@ def process_inputs(
     else:
         for path in tqdm(data):
             process_input_partial(path)
+
+    # Discard the run's MSAs now that they have been copied into msa_dir.
+    # TemporaryDirectory also cleans up on its own if this is never reached.
+    if msa_tmp is not None:
+        msa_tmp.cleanup()
 
     # Load all records and write manifest
     records = [Record.load(p) for p in records_dir.glob("*.json")]
@@ -1026,15 +1030,6 @@ def cli() -> None:
     default="mmseqs",
 )
 @click.option(
-    "--msa_cache_dir",
-    type=click.Path(),
-    help=(
-        "Where locally generated MSAs are cached. Used only if --use_local_msa "
-        "is set. Default is <cache>/msa_cache."
-    ),
-    default=None,
-)
-@click.option(
     "--mmseqs_sensitivity",
     type=float,
     help="MMseqs2 search sensitivity (-s). Used only if --use_local_msa is set. Default is 7.5.",
@@ -1154,7 +1149,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     use_local_msa: bool = False,
     mmseqs_db_dir: Optional[str] = None,
     mmseqs_binary: str = "mmseqs",
-    msa_cache_dir: Optional[str] = None,
     mmseqs_sensitivity: float = 7.5,
     max_paired_msa_rows: int = 4096,
     use_potentials: bool = False,
@@ -1229,7 +1223,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             raise click.UsageError(msg)
         local_msa = {
             "db_dir": Path(mmseqs_db_dir).expanduser(),
-            "cache_dir": Path(msa_cache_dir or cache / "msa_cache").expanduser(),
             "mmseqs": mmseqs_binary,
             "sensitivity": mmseqs_sensitivity,
             "max_paired_rows": max_paired_msa_rows,
