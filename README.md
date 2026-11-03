@@ -42,20 +42,65 @@ The script needs about 800 GB of free disk space while it runs. See [AlphaFast's
 
 ### Installing this fork
 
+This fork is published under the package name `boltz`, the same name as upstream. Pip keeps only one package per name, so **this fork replaces upstream Boltz rather than installing alongside it**. Do not install both. If you already have upstream Boltz, see [Replacing an existing Boltz install](#replacing-an-existing-boltz-install) below.
+
+**1. Create an environment.** Any Python 3.10, 3.11 or 3.12 environment works; the example below uses conda. A dedicated environment is recommended, since installing upstream Boltz into the same one later would overwrite this fork.
+
+```
+conda create -n boltz2 python=3.11
+conda activate boltz2
+```
+
+**2. Install PyTorch.** On NVIDIA Blackwell GPUs (RTX 50 series, RTX PRO 6000/4500 Blackwell, B200), install a build for CUDA 12.8 or newer **before** the next step, so it isn't resolved to one that lacks Blackwell support:
+
+```
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+On older GPUs, skip this step and let the next one install PyTorch.
+
+**3. Install the fork.**
+
 ```
 git clone https://github.com/martien2kk/boltz2_local_mmseq2.git
 cd boltz2_local_mmseq2
 pip install -e .[cuda]
 ```
 
-On NVIDIA Blackwell GPUs (RTX 50 series, RTX PRO 6000/4500 Blackwell, B200), install a PyTorch build for CUDA 12.8 or newer **first**, so the step above doesn't replace it with one that lacks Blackwell support:
+This is an editable install, so the clone directory *is* the installed package: edits to `src/boltz/` take effect on the next run, but moving or deleting the clone breaks the environment. For an install that does not depend on a local clone, use `pip install "boltz[cuda] @ git+https://github.com/martien2kk/boltz2_local_mmseq2.git"` instead.
+
+**4. Put the MMseqs2 GPU binary on `PATH`**, as described under [Requirements](#requirements). Installing this package does not provide it. `$CONDA_PREFIX/bin` is a convenient location, since it is on `PATH` whenever the environment is active.
+
+**5. Check the install.**
 
 ```
-pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip show boltz | grep -E "Version|Editable"   # Version: 2.2.1+localmsa
+boltz predict --help | grep use_local_msa     # the option is present
+mmseqs search -h | grep -- "--gpu "           # GPU build of MMseqs2
+python -m pytest tests/test_local_msa.py
+```
+
+Set `BOLTZ_MMSEQS_DB_DIR` before the pytest to also run a real search against your databases.
+
+Batch jobs that do not activate the environment need `PATH` set so `mmseqs` can be found, for example `export PATH="$(dirname "$BOLTZ_BIN"):$PATH"`.
+
+### Replacing an existing Boltz install
+
+If `pip show boltz` reports a version without the `+localmsa` suffix, that environment has upstream Boltz. Either make a new environment with the steps above, which leaves the existing one untouched, or replace it in place:
+
+```
+conda activate <existing-env>
+pip uninstall boltz
+git clone https://github.com/martien2kk/boltz2_local_mmseq2.git
+cd boltz2_local_mmseq2
 pip install -e .[cuda]
 ```
 
-To check the feature, run `python -m pytest tests/test_local_msa.py`. Set `BOLTZ_MMSEQS_DB_DIR` to also run a real search.
+Installing over the old version without uninstalling usually works, but uninstalling first avoids leaving behind files from the previous install.
+
+Downloaded model weights live in `~/.boltz` and are shared by both, so they are not downloaded again. Existing inputs, scripts and outputs are unaffected: everything except the added options works exactly as in upstream Boltz.
+
+Afterwards, `pip install boltz` in that environment would replace this fork with upstream again and remove `--use_local_msa`. If that happens, reinstall with the commands above.
 
 
 <div align="center">
