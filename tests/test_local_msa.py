@@ -19,6 +19,7 @@ from boltz.data.msa.local_mmseqs import (
     build_rows,
     cached_msa_path,
     check_disk_space,
+    checked_sequence,
     check_setup,
     collect_sequences,
     read_fasta,
@@ -63,6 +64,83 @@ def test_visible_devices_never_returns_nothing(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert visible_devices(0) == ["0"]
     assert visible_devices(-1) == ["0"]
+
+
+def test_rejects_sequences_that_would_break_the_fasta_or_csv():
+    # Written as ">{i}\n{seq}", a ">" after a newline starts a record of its
+    # own and every later query's index stops matching its sequence. Written
+    # as "{key},{seq}", a comma splits the row. Letters only makes both
+    # impossible instead of unlikely.
+    for bad in ["MKTA\n>9\nEVIL", "MKTA\nEVIL", "MKT,AYI", "MKTAYI-", "mktayi", ""]:
+        with pytest.raises(ValueError, match="protein sequence is"):
+            checked_sequence(bad, Path("job.yaml"))
+
+    assert checked_sequence(QUERY, Path("job.yaml")) == QUERY
+
+
+def test_rejected_sequence_names_the_file_and_the_characters():
+    with pytest.raises(ValueError) as err:
+        checked_sequence("MKT@AYI", Path("/inputs/job.yaml"))
+    assert "/inputs/job.yaml" in str(err.value)
+    assert "'@'" in str(err.value)
+
+
+def test_collect_sequences_rejects_a_bad_sequence(tmp_path):
+    job = tmp_path / "job.yaml"
+    job.write_text("sequences:\n  - protein:\n      id: A\n      sequence: MK TA\n")
+    with pytest.raises(ValueError, match="protein sequence is"):
+        collect_sequences([job])
+
+
+def test_write_csv_refuses_a_row_that_would_break_the_format(tmp_path):
+    path = tmp_path / "msa.csv"
+    with pytest.raises(ValueError, match="break the CSV"):
+        write_csv(path, [(-1, QUERY), (9606, "MKTA,YIAK")])
+    assert not path.exists()
+
+
+@pytest.mark.skipif(
+    not (Path.home() / ".boltz" / "mols").exists(),
+    reason="needs the Boltz mol cache (~/.boltz/mols)",
+)
+def test_collect_sequences_agrees_with_the_boltz_parser():
+    # collect_sequences decides which proteins need an MSA without using
+    # Boltz's parser, so the two can drift apart: a new way of declaring an
+    # MSA upstream would have this module searching sequences Boltz does not
+    # want searched. Pin them together on the shipped examples.
+    from boltz.data import const
+    from boltz.data.mol import load_canonicals
+    from boltz.data.parse.yaml import parse_yaml
+
+    mol_dir = Path.home() / ".boltz" / "mols"
+    ccd = load_canonicals(mol_dir)
+    prot_id = const.chain_type_ids["PROTEIN"]
+
+    examples = sorted(Path(__file__).parent.parent.glob("examples/*.yaml"))
+    assert examples, "no example inputs found"
+
+    compared, unparsed = [], []
+    for path in examples:
+        try:
+            target = parse_yaml(path, ccd, mol_dir, boltz2=True)
+        except Exception as err:  # noqa: BLE001
+            # Boltz's own parser failing is not drift, and this test should
+            # not go red for an upstream bug. Skip the input, but record it:
+            # an input Boltz cannot read is one this test does not cover.
+            unparsed.append(f"{path.name}: {type(err).__name__}: {err}")
+            continue
+
+        wanted = {
+            target.sequences[chain.entity_id]
+            for chain in target.record.chains
+            if chain.mol_type == prot_id and chain.msa_id == 0
+        }
+        assert set(collect_sequences([path])) == wanted, path
+        compared.append(path.name)
+
+    assert compared, f"no example could be parsed by Boltz: {unparsed}"
+    if unparsed:
+        print(f"\nnot covered, Boltz could not parse: {unparsed}")
 
 
 def test_sequence_id_is_stable_and_distinct():

@@ -19,6 +19,7 @@ import os
 import queue
 import re
 import shutil
+import string
 import subprocess
 import tempfile
 import threading
@@ -50,6 +51,45 @@ SEARCH_ORDER = ("uniref90", "mgnify", "uniprot", "small_bfd")
 TMP_BYTES_PER_SEQUENCE = 250 * 1024**2
 
 TAXON_ID = re.compile(r"\bOX=(\d+)")
+
+# Letters Boltz has a protein token for. A query sequence holding anything
+# else is rejected rather than cleaned up: the sequence is written straight
+# into a FASTA and a CSV, and Boltz parses the same input separately, so a
+# sequence this module silently altered would no longer be the one Boltz
+# folds. See checked_sequence.
+PROTEIN_LETTERS = frozenset(string.ascii_uppercase)
+
+
+def checked_sequence(sequence: str, path: Path) -> str:
+    """Return a protein sequence, or raise if it is not one Boltz can use.
+
+    This is a guard as much as a check. Sequences are written into a FASTA as
+    `>{index}\\n{sequence}`, and a newline or ">" inside one would start a
+    FASTA record of its own, shifting every later query's index away from the
+    sequence it belongs to. They are also written into a CSV as `{key},{seq}`,
+    where a comma or newline breaks the row. Allowing only letters makes all
+    of that impossible rather than merely unlikely.
+
+    Parameters
+    ----------
+    sequence : str
+        The sequence as it appears in the input.
+    path : Path
+        The input file it came from, named in the error.
+
+    Returns
+    -------
+    str
+        The sequence, unchanged.
+
+    """
+    bad = sorted(set(sequence) - PROTEIN_LETTERS)
+    if not sequence or bad:
+        shown = ", ".join(repr(c) for c in bad)
+        reason = f"characters Boltz has no protein token for: {shown}"
+        msg = f"{path}: protein sequence is {'empty' if not sequence else reason}."
+        raise ValueError(msg)
+    return sequence
 
 
 def sequence_id(sequence: str) -> str:
@@ -88,13 +128,15 @@ def collect_sequences(paths: list[Path]) -> list[str]:
             for entry in doc.get("sequences", []):
                 protein = entry.get("protein")
                 if protein and protein.get("msa") in (None, "", 0):
-                    sequences.append(str(protein["sequence"]))
+                    sequences.append(
+                        checked_sequence(str(protein["sequence"]), path)
+                    )
         elif suffix in (".fa", ".fas", ".fasta"):
             for header, seq in read_fasta(path.read_text()):
                 fields = header.split()[0].split("|")
                 is_protein = len(fields) >= 2 and fields[1].lower() == "protein"
                 if is_protein and (len(fields) < 3 or fields[2] == ""):
-                    sequences.append(seq)
+                    sequences.append(checked_sequence(seq, path))
     return list(dict.fromkeys(sequences))
 
 
@@ -322,9 +364,21 @@ def build_rows(
 
 
 def write_csv(path: Path, rows: list[tuple[int, str]]) -> None:
-    """Write MSA rows as a Boltz CSV, atomically."""
+    """Write MSA rows as a Boltz CSV, atomically.
+
+    A sequence holding a comma or a newline would split its row in two and
+    silently shift every column after it, so refuse rather than write one.
+    checked_sequence keeps queries clean; this covers the aligned rows, which
+    come from the databases.
+    """
+    lines = ["key,sequence"]
+    for key, seq in rows:
+        if {",", "\n", "\r"} & set(seq):
+            msg = f"Refusing to write a row that would break the CSV: {path.name}"
+            raise ValueError(msg)
+        lines.append(f"{key},{seq}")
+
     tmp = path.with_suffix(".csv.tmp")
-    lines = ["key,sequence"] + [f"{key},{seq}" for key, seq in rows]
     tmp.write_text("\n".join(lines) + "\n")
     tmp.replace(path)
 
@@ -591,6 +645,28 @@ def search_sequences(  # noqa: PLR0913
             with ThreadPoolExecutor(max_workers=len(SEARCH_ORDER)) as executor:
                 pending = {n: executor.submit(one_database, n) for n in SEARCH_ORDER}
                 results = {n: f.result() for n, f in pending.items()}
+
+            # Hits are matched to sequences by position in the query FASTA, so
+            # a result index outside it means the two have come apart and the
+            # hits cannot be trusted to belong to the sequences they land on.
+            # checked_sequence should make this unreachable; say so clearly if
+            # it ever happens rather than failing later on a missing key.
+            expected = set(range(len(todo)))
+            for name, hits in results.items():
+                unexpected = sorted(set(hits) - expected)
+                if unexpected:
+                    msg = (
+                        f"{name} returned results for queries "
+                        f"{unexpected} but only {len(todo)} were searched. "
+                        "The query database does not match the sequences."
+                    )
+                    raise RuntimeError(msg)
+                missing = sorted(expected - set(hits))
+                if missing:
+                    logger.warning(
+                        "%s returned no result for %d of %d queries (%s)",
+                        name, len(missing), len(todo), missing[:10],
+                    )  # fmt: skip
 
             # Merge in UNPAIRED_DATABASES order, not search order: it decides
             # which rows max_rows keeps, so it has to stay fixed.
