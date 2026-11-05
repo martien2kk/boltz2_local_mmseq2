@@ -60,7 +60,18 @@ The search results live in a temporary folder for the duration of the run and ar
 | `--mmseqs_db_dir` | `$BOLTZ_MMSEQS_DB_DIR` | Folder with the four padded databases (required) |
 | `--mmseqs_binary` | `mmseqs` | MMseqs2 binary name or path |
 | `--mmseqs_sensitivity` | 7.5 | MMseqs2 `-s` |
+| `--mmseqs_tmp_dir` | system temp (`$TMPDIR`, usually `/tmp`) | Where MMseqs2 intermediates go |
+| `--msa_gpus` | 1 | GPUs to spread the database searches over |
+| `--msa_batch_size` | no limit | Search in groups of this many sequences (see below) |
 | `--max_paired_msa_rows` | 4096 | Cap on taxonomy-keyed rows (see below) |
+
+Intermediate MMseqs2 files can be large — the search results for 50,000 UniProt hits per query, before they are reduced to CSV rows. On a cluster, the default temp directory is often small or on a network filesystem, so point `--mmseqs_tmp_dir` (or `BOLTZ_MMSEQS_TMP_DIR`) at node-local scratch:
+
+```bash
+boltz predict job.yaml --use_local_msa --mmseqs_tmp_dir "$SLURM_TMPDIR" --out_dir results/
+```
+
+Free space there is checked before the search starts and a warning is logged if it looks too small. The estimate is rough, so it warns rather than stops; each database also logs the size of the intermediates it actually produced, which is the number to plan with.
 
 `--use_local_msa` cannot be combined with `--use_msa_server`. Setting the database folder once in your shell saves typing:
 
@@ -101,14 +112,39 @@ sequences:
 ```
 sequences ─► drop duplicates, and any already written in this run
           ─► mmseqs createdb                        (all new sequences, one query DB)
-          ─► for each of uniref90, small_bfd, mgnify, uniprot:
-               mmseqs search -a --gpu 1             (find and align hits)
+          ─► for each of uniref90, mgnify, uniprot, small_bfd:
+               mmseqs search -a --gpu 1             (one database at a time)
+             and, in a worker thread while the next database searches:
                mmseqs result2msa --msa-format-mode 2 (aligned FASTA, headers kept)
                mmseqs unpackdb                      (one file per query)
+               keep only the hits that can become rows, then delete the rest
           ─► combine rows per sequence ─► <cache_dir>/<sha256>.csv
 ```
 
 `--msa-format-mode 2` writes every row at the query's length, with insertions removed. Boltz reads that directly, so no further alignment step is needed.
+
+By default the searches run one database at a time, since they share one GPU, but each database's post-processing is CPU work and runs in a worker thread while the next search is underway.
+
+`--msa_gpus N` runs N searches at once instead, one per GPU, up to one per database. A search holds a GPU only while it runs, and `--threads` is divided between them. The devices come from `CUDA_VISIBLE_DEVICES` where a scheduler has set it, so an allocation of GPUs 2 and 3 uses those and not 0 and 1. Whether this helps depends on where the databases live: a search streams its whole database off disk, so several at once can contend for bandwidth rather than go faster, especially on shared storage. The per-database log lines name the GPU and split search from post-processing, so one run tells you which it is — if search times grow roughly in step with the GPU count, drop back to 1. The databases are searched in the order above, chosen so the one needing the least post-processing comes last, where nothing follows it to overlap with. Rows are merged in a fixed order independent of this, so the MSAs do not depend on the search schedule. On one RTX PRO 4500 Blackwell, 7 sequences took 337.9 s with the overlap against 372.9 s without, and the MSAs were byte-identical.
+
+### Memory, and when to batch
+
+All sequences are searched together, so what the search holds in memory grows with the number of sequences in the run. Hits are reduced to what can still become CSV rows as each query's file is read, which is what keeps that growth modest:
+
+- UniProt returns up to 50,000 hits per query, but only taxonomy-keyed ones become rows and only the first `--max_paired_msa_rows` (4,096) of those. The rest are dropped as the file is read rather than held until the end.
+- Unpaired hits are kept as bare sequences; their headers are never used, since every row built from them is keyed `-1`.
+- Repeats of a sequence already kept are dropped at the same point.
+- Each database's intermediates are deleted as soon as its hits have been read, so temporary space holds what the searches still running need, not every database's output at once.
+
+None of this changes the CSVs — what is dropped is exactly what row building would have ignored. The test suite checks that property directly.
+
+If a run is still too large, `--msa_batch_size N` searches the sequences in groups of N:
+
+```bash
+boltz predict inputs/ --use_local_msa --msa_batch_size 200 --out_dir results/
+```
+
+Reach for this last. Every group reads all four databases again, and a search streams its whole database off disk, so two groups cost close to two full searches. Groups do share one cache directory, so a sequence searched in an earlier group is not searched again in a later one.
 
 ### Search settings
 

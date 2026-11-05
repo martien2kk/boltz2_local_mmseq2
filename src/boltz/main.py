@@ -694,6 +694,7 @@ def process_inputs(
     boltz2: bool = False,
     preprocessing_threads: int = 1,
     local_msa: Optional[dict] = None,
+    msa_batch_size: Optional[int] = None,
 ) -> Manifest:
     """Process the input data and output directory.
 
@@ -799,7 +800,17 @@ def process_inputs(
         click.echo(
             f"Local MSAs: {len(sequences)} unique protein sequence(s) to search."
         )
-        search_sequences(sequences, **local_msa)
+        if msa_batch_size:
+            # Every group pays for reading all four databases again, so this
+            # is for runs that cannot hold one search, not for speed. Groups
+            # share one cache_dir, so a sequence searched in an earlier group
+            # is skipped in a later one rather than searched twice.
+            groups = range(0, len(sequences), msa_batch_size)
+            for n, i in enumerate(groups, start=1):
+                click.echo(f"MSA group {n} of {len(groups)}.")
+                search_sequences(sequences[i : i + msa_batch_size], **local_msa)
+        else:
+            search_sequences(sequences, **local_msa)
 
     # Create partial function
     process_input_partial = partial(
@@ -1036,6 +1047,43 @@ def cli() -> None:
     default=7.5,
 )
 @click.option(
+    "--msa_gpus",
+    type=click.IntRange(min=1),
+    help=(
+        "How many GPUs to spread the MMseqs2 database searches over, at most "
+        "one per database. Searches read the databases from disk, so on shared "
+        "storage several at once may contend for bandwidth rather than go "
+        "faster; raise this only if a run shows it helps. Used only if "
+        "--use_local_msa is set. Default is 1."
+    ),
+    default=1,
+)
+@click.option(
+    "--msa_batch_size",
+    type=click.IntRange(min=1),
+    help=(
+        "Search the sequences in groups of this many instead of all at once. "
+        "Each group re-reads all four databases, so this costs roughly a full "
+        "search per extra group; use it only when searching everything "
+        "together runs out of memory or temporary space. Sequences already "
+        "searched in an earlier group are not searched again. Used only if "
+        "--use_local_msa is set. Default is no limit."
+    ),
+    default=None,
+)
+@click.option(
+    "--mmseqs_tmp_dir",
+    type=click.Path(exists=True, file_okay=False),
+    envvar="BOLTZ_MMSEQS_TMP_DIR",
+    help=(
+        "Where MMseqs2 intermediates are written. Point this at fast local "
+        "storage on a cluster whose default temp directory is small or on a "
+        "network filesystem. Used only if --use_local_msa is set. Default is "
+        "the system temp directory. Can also be set via BOLTZ_MMSEQS_TMP_DIR."
+    ),
+    default=None,
+)
+@click.option(
     "--max_paired_msa_rows",
     type=int,
     help=(
@@ -1150,6 +1198,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     mmseqs_db_dir: Optional[str] = None,
     mmseqs_binary: str = "mmseqs",
     mmseqs_sensitivity: float = 7.5,
+    msa_gpus: int = 1,
+    msa_batch_size: Optional[int] = None,
+    mmseqs_tmp_dir: Optional[str] = None,
     max_paired_msa_rows: int = 4096,
     use_potentials: bool = False,
     model: Literal["boltz1", "boltz2"] = "boltz2",
@@ -1226,6 +1277,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "mmseqs": mmseqs_binary,
             "sensitivity": mmseqs_sensitivity,
             "max_paired_rows": max_paired_msa_rows,
+            "n_gpus": msa_gpus,
+            "tmp_dir": Path(mmseqs_tmp_dir).expanduser() if mmseqs_tmp_dir else None,
         }
         click.echo(f"Local MSA generation enabled: {local_msa['db_dir']}")
 
@@ -1276,6 +1329,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
         local_msa=local_msa,
+        msa_batch_size=msa_batch_size,
     )
 
     # Load manifest

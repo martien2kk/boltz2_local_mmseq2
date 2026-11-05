@@ -16,11 +16,14 @@ between runs; pass a lasting path yourself to reuse MSAs across runs.
 import hashlib
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +35,19 @@ logger = logging.getLogger(__name__)
 UNPAIRED_DATABASES = {"uniref90": 10000, "small_bfd": 5000, "mgnify": 5000}
 PAIRING_DATABASE = "uniprot"
 PAIRING_MAX_HITS = 50000
+
+# Order the GPU searches are run in. One database's post-processing overlaps
+# the next one's search, so whichever needs the least post-processing goes
+# last, where nothing follows it to hide behind. Hits are merged in
+# UNPAIRED_DATABASES order whatever this says, so it does not affect the MSAs.
+SEARCH_ORDER = ("uniref90", "mgnify", "uniprot", "small_bfd")
+
+# Rough temporary space one query needs for MMseqs2 intermediates: the search
+# result database, the aligned FASTA from result2msa, and the unpacked copy of
+# it. It scales with hits and query length, so it is an order-of-magnitude
+# guide for the preflight warning, not a measured bound. The actual peak is
+# logged at the end of a search, so a run tells you your own number.
+TMP_BYTES_PER_SEQUENCE = 250 * 1024**2
 
 TAXON_ID = re.compile(r"\bOX=(\d+)")
 
@@ -129,10 +145,132 @@ def read_fasta(text: str) -> list[tuple[str, str]]:
     return entries
 
 
+def reduce_paired(
+    entries: list[tuple[str, str]], limit: int
+) -> list[tuple[str, str]]:
+    """Keep only the paired hits build_rows could still use.
+
+    Hits arrive best first. build_rows keeps at most max_paired_rows of them,
+    ignores any without a taxonomy id, and drops repeats of a sequence it has
+    already taken, so everything past that point is read and held for nothing.
+    UniProt returns up to PAIRING_MAX_HITS (50,000) per query against a budget
+    of 4,096, which makes this most of the memory the search ever uses.
+
+    Parameters
+    ----------
+    entries : list[tuple[str, str]]
+        Hits as (header, aligned sequence), best first.
+    limit : int
+        How many to keep. Pass one more than build_rows can use, since one of
+        them may turn out to repeat the query and be dropped there instead.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        The kept hits, in their original order.
+
+    """
+    kept: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for header, aligned in entries:
+        if len(kept) >= limit:
+            break
+        if not TAXON_ID.search(header):
+            continue
+        ungapped = aligned.replace("-", "").upper()
+        if ungapped not in seen:
+            seen.add(ungapped)
+            kept.append((header, aligned))
+    return kept
+
+
+def reduce_unpaired(entries: list[tuple[str, str]], limit: int) -> list[str]:
+    """Keep only the unpaired hits build_rows could still use.
+
+    As reduce_paired, but build_rows never looks at an unpaired hit's header
+    (every such row is keyed -1), so the header is dropped here rather than
+    carried through the merge.
+
+    Parameters
+    ----------
+    entries : list[tuple[str, str]]
+        Hits as (header, aligned sequence), best first.
+    limit : int
+        How many to keep; max_rows, which no single database can exceed.
+
+    Returns
+    -------
+    list[str]
+        The kept aligned sequences, in their original order.
+
+    """
+    kept: list[str] = []
+    seen: set[str] = set()
+    for _, aligned in entries:
+        if len(kept) >= limit:
+            break
+        ungapped = aligned.replace("-", "").upper()
+        if ungapped not in seen:
+            seen.add(ungapped)
+            kept.append(aligned)
+    return kept
+
+
+def check_disk_space(tmp_dir: Optional[Path], n_sequences: int) -> None:
+    """Warn if the temporary directory looks too small for the search.
+
+    MMseqs2 intermediates are far larger than the MSAs they reduce to, and on
+    a cluster the default temp directory is often small and shared. Filling it
+    takes down other jobs on the node, so say so before the search rather than
+    after. The estimate is rough, so this warns and continues.
+
+    Parameters
+    ----------
+    tmp_dir : Path, optional
+        Where intermediates will go. None means the system temp directory.
+    n_sequences : int
+        How many sequences are about to be searched.
+
+    """
+    target = Path(tmp_dir) if tmp_dir is not None else Path(tempfile.gettempdir())
+    try:
+        free = shutil.disk_usage(target).free
+    except OSError as err:  # unreadable mount point, missing path
+        logger.warning("Could not check free space on %s: %s", target, err)
+        return
+
+    needed = n_sequences * TMP_BYTES_PER_SEQUENCE
+    gib = 1024**3
+    if free < needed:
+        logger.warning(
+            "%s has %.1f GiB free; %d sequence(s) may need about %.1f GiB of "
+            "MMseqs2 intermediates. Point --mmseqs_tmp_dir at larger storage, "
+            "or lower --msa_batch_size.",
+            target, free / gib, n_sequences, needed / gib,
+        )  # fmt: skip
+    else:
+        logger.info(
+            "Temporary directory %s: %.1f GiB free, about %.1f GiB estimated.",
+            target, free / gib, needed / gib,
+        )  # fmt: skip
+
+
+def directory_size(path: Path) -> int:
+    """Return the total size in bytes of every file under a directory."""
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:  # removed while walking
+            continue
+    return total
+
+
 def build_rows(
     query: str,
     paired_hits: list[tuple[str, str]],
-    unpaired_hits: list[tuple[str, str]],
+    unpaired_hits: list[str],
     max_paired_rows: int,
     max_rows: int,
 ) -> list[tuple[int, str]]:
@@ -144,8 +282,9 @@ def build_rows(
         The query sequence, always the first row.
     paired_hits : list[tuple[str, str]]
         UniProt hits as (header, aligned sequence), best first.
-    unpaired_hits : list[tuple[str, str]]
-        Other hits as (header, aligned sequence), best first.
+    unpaired_hits : list[str]
+        Other hits as aligned sequences, best first. Headers are dropped by
+        reduce_unpaired, since every row built from them is keyed -1.
     max_paired_rows : int
         Maximum number of taxonomy-keyed rows.
     max_rows : int
@@ -174,7 +313,7 @@ def build_rows(
         if match:
             add(int(match.group(1)), aligned)
 
-    for _, aligned in unpaired_hits:
+    for aligned in unpaired_hits:
         if len(rows) >= max_rows:
             break
         add(-1, aligned)
@@ -190,15 +329,53 @@ def write_csv(path: Path, rows: list[tuple[int, str]]) -> None:
     tmp.replace(path)
 
 
-def _run(cmd: list[str]) -> None:
-    """Run an MMseqs2 command, raising with its stderr on failure."""
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)  # noqa: S603
+def _run(cmd: list[str], device: Optional[str] = None) -> None:
+    """Run an MMseqs2 command, raising with its stderr on failure.
+
+    When device is given, the command sees only that CUDA device.
+    """
+    env = None
+    if device is not None:
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)  # noqa: S603
     if proc.returncode != 0:
         msg = f"{' '.join(cmd[:2])} failed:\n{proc.stderr[-2000:]}{proc.stdout[-2000:]}"
         raise RuntimeError(msg)
 
 
-def _search_database(  # noqa: PLR0913
+def visible_devices(n_gpus: int) -> list[str]:
+    """Return CUDA device ids to spread searches over.
+
+    CUDA_VISIBLE_DEVICES holds absolute device ids, so a child given "0" sees
+    physical device 0, not the first device of the parent's allocation. Take
+    the ids from the parent's allocation where there is one, so a scheduler
+    that hands out GPUs 2 and 3 is honoured.
+
+    Parameters
+    ----------
+    n_gpus : int
+        How many devices to use at once.
+
+    Returns
+    -------
+    list[str]
+        Device ids, at most n_gpus of them.
+
+    """
+    n_gpus = max(1, n_gpus)  # never return an empty device list
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    allocated = [d.strip() for d in visible.split(",") if d.strip()]
+    if not allocated:
+        allocated = [str(i) for i in range(n_gpus)]
+    if n_gpus > len(allocated):
+        logger.warning(
+            "Asked for %d GPUs but only %d visible (%s); using %d.",
+            n_gpus, len(allocated), ",".join(allocated), len(allocated),
+        )  # fmt: skip
+    return allocated[:n_gpus]
+
+
+def _gpu_search(  # noqa: PLR0913
     mmseqs: str,
     query_db: Path,
     target_db: Path,
@@ -208,17 +385,18 @@ def _search_database(  # noqa: PLR0913
     e_value: float,
     threads: int,
     gpu: bool,
-) -> dict[int, list[tuple[str, str]]]:
-    """Search all queries against one database.
+    device: Optional[str] = None,
+) -> dict:
+    """Search all queries against one database, the GPU half only.
 
     Returns
     -------
-    dict[int, list[tuple[str, str]]]
-        Query index -> hits as (header, aligned sequence), query row excluded.
+    dict
+        What _postprocess needs to turn the result into hits.
 
     """
     work.mkdir()
-    result, msa, out = work / "result", work / "msa", work / "out"
+    result = work / "result"
     search = [
         mmseqs, "search", str(query_db), str(target_db), str(result), str(work / "tmp"),
         "-a",
@@ -229,12 +407,77 @@ def _search_database(  # noqa: PLR0913
     ]  # fmt: skip
     if gpu:
         search += ["--gpu", "1"]
-    _run(search)
+
+    start = time.time()
+    _run(search, device=device)
+    return {
+        "result": result,
+        "target_db": target_db,
+        "work": work,
+        "device": device,
+        "search_time": time.time() - start,
+    }
+
+
+def _postprocess(
+    mmseqs: str, query_db: Path, gpu_result: dict, paired: bool, limit: int
+) -> dict[int, list]:
+    """Turn one database's search result into hits. Uses the CPU only, so it
+    runs in a worker thread while the next database searches on the GPU.
+
+    Each query's hits are reduced as they are read, so only what build_rows
+    can still use is ever held. The database's intermediates are deleted
+    straight afterwards, which bounds temporary space at what the searches
+    still running need rather than at every database's output at once.
+
+    Parameters
+    ----------
+    mmseqs : str
+        MMseqs2 binary path.
+    query_db : Path
+        The shared query database.
+    gpu_result : dict
+        What _gpu_search returned.
+    paired : bool
+        Whether this is the pairing database, whose hits keep their headers.
+    limit : int
+        Hits kept per query, after dropping repeats of a sequence.
+
+    Returns
+    -------
+    dict[int, list]
+        Query index -> hits, best first, query row excluded. Pairing hits are
+        (header, aligned sequence); the rest are aligned sequences.
+
+    """
+    work, result = gpu_result["work"], gpu_result["result"]
+    target_db = gpu_result["target_db"]
+    msa, out = work / "msa", work / "out"
+
+    start = time.time()
     _run([mmseqs, "result2msa", str(query_db), str(target_db), str(result), str(msa),
           "--msa-format-mode", "2"])  # fmt: skip
     _run([mmseqs, "unpackdb", str(msa), str(out), "--unpack-name-mode", "0"])
 
-    return {int(f.name): read_fasta(f.read_text())[1:] for f in out.iterdir()}
+    reduce = reduce_paired if paired else reduce_unpaired
+    hits = {}
+    for f in out.iterdir():
+        # One file at a time, reduced before the next is read.
+        hits[int(f.name)] = reduce(read_fasta(f.read_text())[1:], limit)
+
+    peak = directory_size(work)
+    shutil.rmtree(work, ignore_errors=True)
+
+    device = gpu_result["device"]
+    logger.info(
+        "%s%s: %.1f s search, %.1f s post-processing, %.2f GiB intermediates",
+        target_db.name,
+        f" (GPU {device})" if device is not None else "",
+        gpu_result["search_time"],
+        time.time() - start,
+        peak / 1024**3,
+    )
+    return hits
 
 
 def search_sequences(  # noqa: PLR0913
@@ -246,6 +489,7 @@ def search_sequences(  # noqa: PLR0913
     e_value: float = 1e-4,
     threads: Optional[int] = None,
     gpu: bool = True,
+    n_gpus: int = 1,
     tmp_dir: Optional[Path] = None,
     max_paired_rows: int = 4096,
     max_rows: int = 16384,
@@ -274,6 +518,8 @@ def search_sequences(  # noqa: PLR0913
         CPU threads. Defaults to all available.
     gpu : bool
         Whether to search on the GPU.
+    n_gpus : int
+        How many GPUs to spread the database searches over.
     tmp_dir : Path, optional
         Where to put intermediate files.
     max_paired_rows : int
@@ -296,6 +542,7 @@ def search_sequences(  # noqa: PLR0913
         threads = threads or len(os.sched_getaffinity(0))
         start = time.time()
         logger.info("Searching %d sequence(s) with MMseqs2", len(todo))
+        check_disk_space(tmp_dir, len(todo))
 
         with tempfile.TemporaryDirectory(prefix="boltz_mmseqs_", dir=tmp_dir) as tmp:
             work = Path(tmp)
@@ -304,17 +551,54 @@ def search_sequences(  # noqa: PLR0913
             query_db = work / "queryDB"
             _run([mmseqs, "createdb", str(fasta), str(query_db)])
 
-            def search(name: str, max_hits: int) -> dict[int, list[tuple[str, str]]]:
-                return _search_database(
-                    mmseqs, query_db, Path(db_dir) / f"{name}_padded", max_hits,
-                    work / name, sensitivity, e_value, threads, gpu,
-                )  # fmt: skip
+            # One task per database. A device is held only for the search, so
+            # with one GPU the searches run one at a time and each database's
+            # post-processing overlaps the next search. With several GPUs that
+            # many searches run at once, one per device.
+            max_hits_by_db = {**UNPAIRED_DATABASES, PAIRING_DATABASE: PAIRING_MAX_HITS}
+            devices = visible_devices(n_gpus) if gpu else [None]
+            search_threads = max(1, threads // len(devices))
+            free_devices = queue.Queue()
+            for device in devices:
+                free_devices.put(device)
+            cpu_slots = threading.Semaphore(len(devices))
 
+            def one_database(name: str) -> dict[int, list]:
+                device = free_devices.get()
+                try:
+                    gpu_result = _gpu_search(
+                        mmseqs, query_db, Path(db_dir) / f"{name}_padded",
+                        max_hits_by_db[name], work / name, sensitivity, e_value,
+                        search_threads, gpu, device,
+                    )  # fmt: skip
+                finally:
+                    free_devices.put(device)
+                # How many hits build_rows could still use from one database.
+                # It needs its remaining row budget, plus one spare for every
+                # row already placed, since a kept hit may repeat one of them
+                # and be dropped. Those two add up to the total row cap: for
+                # the pairing database max_paired_rows against the query
+                # alone, and for the rest max_rows.
+                paired = name == PAIRING_DATABASE
+                limit = max_paired_rows + 1 if paired else max_rows
+                with cpu_slots:
+                    return _postprocess(mmseqs, query_db, gpu_result, paired, limit)
+
+            logger.info(
+                "Searching %d database(s) over %d device(s), %d threads each",
+                len(SEARCH_ORDER), len(devices), search_threads,
+            )  # fmt: skip
+            with ThreadPoolExecutor(max_workers=len(SEARCH_ORDER)) as executor:
+                pending = {n: executor.submit(one_database, n) for n in SEARCH_ORDER}
+                results = {n: f.result() for n, f in pending.items()}
+
+            # Merge in UNPAIRED_DATABASES order, not search order: it decides
+            # which rows max_rows keeps, so it has to stay fixed.
             unpaired = {i: [] for i in range(len(todo))}
-            for name, max_hits in UNPAIRED_DATABASES.items():
-                for i, hits in search(name, max_hits).items():
+            for name in UNPAIRED_DATABASES:
+                for i, hits in results[name].items():
                     unpaired[i].extend(hits)
-            paired = search(PAIRING_DATABASE, PAIRING_MAX_HITS)
+            paired = results[PAIRING_DATABASE]
 
             for i, seq in enumerate(todo):
                 rows = build_rows(
