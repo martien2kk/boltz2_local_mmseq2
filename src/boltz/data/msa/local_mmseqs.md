@@ -61,9 +61,9 @@ The search results live in a temporary folder for the duration of the run and ar
 | `--mmseqs_binary` | `mmseqs` | MMseqs2 binary name or path |
 | `--mmseqs_sensitivity` | 7.5 | MMseqs2 `-s` |
 | `--mmseqs_tmp_dir` | system temp (`$TMPDIR`, usually `/tmp`) | Where MMseqs2 intermediates go |
-| `--msa_gpus` | 1 | GPUs to spread the database searches over |
+| `--msa_gpus` | 1 | GPUs to spread the database searches over (at most 4) |
 | `--msa_batch_size` | no limit | Search in groups of this many sequences (see below) |
-| `--max_paired_msa_rows` | 4096 | Cap on taxonomy-keyed rows (see below) |
+| `--max_paired_msa_rows` | 4096 | Cap on taxonomy-keyed rows, must be below `--max_msa_seqs` (see below) |
 
 Intermediate MMseqs2 files can be large — the search results for 50,000 UniProt hits per query, before they are reduced to CSV rows. On a cluster, the default temp directory is often small or on a network filesystem, so point `--mmseqs_tmp_dir` (or `BOLTZ_MMSEQS_TMP_DIR`) at node-local scratch:
 
@@ -125,7 +125,7 @@ sequences ─► drop duplicates, and any already written in this run
 
 By default the searches run one database at a time, since they share one GPU, but each database's post-processing is CPU work and runs in a worker thread while the next search is underway.
 
-`--msa_gpus N` runs N searches at once instead, one per GPU, up to one per database. A search holds a GPU only while it runs, and `--threads` is divided between them. The devices come from `CUDA_VISIBLE_DEVICES` where a scheduler has set it, so an allocation of GPUs 2 and 3 uses those and not 0 and 1. Whether this helps depends on where the databases live: a search streams its whole database off disk, so several at once can contend for bandwidth rather than go faster, especially on shared storage. The per-database log lines name the GPU and split search from post-processing, so one run tells you which it is — if search times grow roughly in step with the GPU count, drop back to 1. The databases are searched in the order above, chosen so the one needing the least post-processing comes last, where nothing follows it to overlap with. Rows are merged in a fixed order independent of this, so the MSAs do not depend on the search schedule. On one RTX PRO 4500 Blackwell, 7 sequences took 337.9 s with the overlap against 372.9 s without, and the MSAs were byte-identical.
+`--msa_gpus N` runs N searches at once instead, one per GPU, up to one per database. There are four databases, so asking for more than four is clamped to four and warns: beyond that the extra GPUs would sit idle while the threads were still divided by the number asked for. A search holds a GPU only while it runs, and `--threads` is divided between them. The devices come from `CUDA_VISIBLE_DEVICES` where a scheduler has set it, so an allocation of GPUs 2 and 3 uses those and not 0 and 1. Whether this helps depends on where the databases live: a search streams its whole database off disk, so several at once can contend for bandwidth rather than go faster, especially on shared storage. The per-database log lines name the GPU and split search from post-processing, so one run tells you which it is — if search times grow roughly in step with the GPU count, drop back to 1. The databases are searched in the order above, chosen so the one needing the least post-processing comes last, where nothing follows it to overlap with. Rows are merged in a fixed order independent of this, so the MSAs do not depend on the search schedule. On one RTX PRO 4500 Blackwell, 7 sequences took 337.9 s with the overlap against 372.9 s without, and the MSAs were byte-identical.
 
 ### Memory, and when to batch
 
@@ -190,6 +190,8 @@ One consequence is worth knowing. When a species has several hits for the same c
 Duplicate sequences are dropped, keeping the first copy. Boltz itself keeps only the first copy of a duplicate, so keyed rows must come before their unpaired twins.
 
 **Why cap the keyed rows?** At prediction time Boltz reads only the first `--max_msa_seqs` rows (default 8,192). UniProt can return up to 50,000 hits, and without a cap they would fill that whole window and push out every unpaired hit. With the default cap, at most half of the default window is keyed rows.
+
+The two have to be set together. Lowering `--max_msa_seqs` without lowering `--max_paired_msa_rows` recreates exactly the problem the cap exists to prevent: with `--max_msa_seqs 1024` and the default cap, Boltz reads 1,024 keyed rows and no unpaired row at all. A paired cap at or above the read limit is now refused, and one above half of it warns.
 
 ## Deduplication
 

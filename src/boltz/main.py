@@ -1042,7 +1042,7 @@ def cli() -> None:
 )
 @click.option(
     "--mmseqs_sensitivity",
-    type=float,
+    type=click.FloatRange(min=0, min_open=True),
     help="MMseqs2 search sensitivity (-s). Used only if --use_local_msa is set. Default is 7.5.",
     default=7.5,
 )
@@ -1085,10 +1085,12 @@ def cli() -> None:
 )
 @click.option(
     "--max_paired_msa_rows",
-    type=int,
+    type=click.IntRange(min=0),
     help=(
         "Maximum taxonomy-keyed rows per local MSA, used for chain pairing. "
-        "Used only if --use_local_msa is set. Default is 4096."
+        "Keyed rows come first in the file and Boltz reads only the first "
+        "--max_msa_seqs rows of it, so this must leave room for unpaired "
+        "rows. Used only if --use_local_msa is set. Default is 4096."
     ),
     default=4096,
 )
@@ -1272,6 +1274,25 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         if mmseqs_db_dir is None:
             msg = "--use_local_msa requires --mmseqs_db_dir (or BOLTZ_MMSEQS_DB_DIR)."
             raise click.UsageError(msg)
+        # Keyed rows are written first and Boltz reads the file from the top,
+        # so a paired cap at or above the read limit leaves no room for a
+        # single unpaired row. That silently costs the MSA most of its depth,
+        # so refuse it here rather than let it look like a normal run.
+        if max_paired_msa_rows >= max_msa_seqs:
+            msg = (
+                f"--max_paired_msa_rows ({max_paired_msa_rows}) must be below "
+                f"--max_msa_seqs ({max_msa_seqs}): Boltz reads only the first "
+                f"{max_msa_seqs} rows, and keyed rows come first, so no "
+                "unpaired row would survive. Try "
+                f"--max_paired_msa_rows {max(0, max_msa_seqs // 2)}."
+            )
+            raise click.UsageError(msg)
+        if max_paired_msa_rows > max_msa_seqs // 2:
+            click.echo(
+                f"Warning: --max_paired_msa_rows ({max_paired_msa_rows}) takes "
+                f"more than half of the {max_msa_seqs} rows Boltz reads, "
+                "leaving few unpaired homologs."
+            )
         local_msa = {
             "db_dir": Path(mmseqs_db_dir).expanduser(),
             "mmseqs": mmseqs_binary,

@@ -610,7 +610,17 @@ def search_sequences(  # noqa: PLR0913
             # post-processing overlaps the next search. With several GPUs that
             # many searches run at once, one per device.
             max_hits_by_db = {**UNPAIRED_DATABASES, PAIRING_DATABASE: PAIRING_MAX_HITS}
-            devices = visible_devices(n_gpus) if gpu else [None]
+            # One search per database at most, so asking for more devices than
+            # there are databases would leave the extra ones idle while still
+            # dividing the threads by the number asked for.
+            usable = min(n_gpus, len(SEARCH_ORDER))
+            if n_gpus > usable:
+                logger.warning(
+                    "Asked for %d GPUs but there are only %d databases to "
+                    "search; using %d.",
+                    n_gpus, len(SEARCH_ORDER), usable,
+                )  # fmt: skip
+            devices = visible_devices(usable) if gpu else [None]
             search_threads = max(1, threads // len(devices))
             free_devices = queue.Queue()
             for device in devices:

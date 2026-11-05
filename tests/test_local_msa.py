@@ -11,7 +11,9 @@ import shutil
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+from boltz.main import predict
 from boltz.data.msa.local_mmseqs import (
     PAIRING_DATABASE,
     SEARCH_ORDER,
@@ -141,6 +143,59 @@ def test_collect_sequences_agrees_with_the_boltz_parser():
     assert compared, f"no example could be parsed by Boltz: {unparsed}"
     if unparsed:
         print(f"\nnot covered, Boltz could not parse: {unparsed}")
+
+
+def local_msa_cli(tmp_path, *extra):
+    """Invoke `boltz predict --use_local_msa` with real paths for the rest."""
+    job = tmp_path / "job.yaml"
+    job.write_text(f"sequences:\n  - protein:\n      id: A\n      sequence: {QUERY}\n")
+    return CliRunner().invoke(
+        predict,
+        [str(job), "--use_local_msa", "--mmseqs_db_dir", str(tmp_path),
+         "--out_dir", str(tmp_path / "out"), *extra],
+    )  # fmt: skip
+
+
+def test_rejects_a_paired_cap_that_would_crowd_out_unpaired_rows(tmp_path):
+    # Keyed rows are written first and Boltz reads the file from the top, so
+    # a paired cap at or above --max_msa_seqs leaves room for no unpaired row
+    # at all. The run would otherwise look entirely normal.
+    result = local_msa_cli(
+        tmp_path, "--max_msa_seqs", "1024", "--max_paired_msa_rows", "4096"
+    )
+    assert result.exit_code != 0
+    assert "must be below" in result.output
+    # The value it suggests has to be one that gets past the check.
+    assert "--max_paired_msa_rows 512" in result.output
+
+    result = local_msa_cli(
+        tmp_path, "--max_msa_seqs", "1024", "--max_paired_msa_rows", "512"
+    )
+    assert "must be below" not in result.output
+
+
+def test_warns_when_keyed_rows_take_most_of_the_window(tmp_path):
+    result = local_msa_cli(
+        tmp_path, "--max_msa_seqs", "1024", "--max_paired_msa_rows", "900"
+    )
+    assert "leaving few unpaired homologs" in result.output
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--msa_gpus", "0"),
+        ("--msa_gpus", "-1"),
+        ("--msa_batch_size", "0"),
+        ("--mmseqs_sensitivity", "0"),
+        ("--mmseqs_sensitivity", "-1"),
+        ("--max_paired_msa_rows", "-1"),
+    ],
+)
+def test_resource_options_reject_out_of_range_values(tmp_path, flag, value):
+    result = local_msa_cli(tmp_path, flag, value)
+    assert result.exit_code != 0
+    assert "is not in the range" in result.output
 
 
 def test_sequence_id_is_stable_and_distinct():
