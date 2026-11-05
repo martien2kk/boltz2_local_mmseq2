@@ -6,7 +6,7 @@
 
 - **Privacy.** `--use_msa_server` sends sequences to `api.colabfold.com`. A local search sends nothing.
 - **Speed at scale.** Many sequences are searched together in one GPU pass per database, and identical sequences are collapsed first. A protein used in 100 complexes in one run is searched once.
-- **Same MSAs as AlphaFold3.** The search settings match [AlphaFast](https://github.com/RomeroLab/alphafast)'s MMseqs2-GPU defaults, so Boltz sees the same evolutionary information as an AF3 run on the same databases.
+- **AF3-style search settings.** The databases, sensitivity, E-value and per-database hit limits follow [AlphaFast](https://github.com/RomeroLab/alphafast)'s MMseqs2-GPU defaults, so the hits come from the same searches an AF3 run on those databases would do. How rows are selected from those hits, and how chains are paired, are Boltz's own and are not AF3's — see [Limitations](#limitations).
 
 ## Requirements
 
@@ -177,6 +177,10 @@ When a complex has several protein chains, Boltz lines up rows that share the sa
 
 Rows with key `-1` are never paired. For single-chain jobs, keyed rows simply act as extra unpaired rows.
 
+**This is not how `--use_msa_server` pairs.** There, ColabFold pairs the chains of one complex on the server and the CSV's `key` is a *row number*, so row 5 of chain A is paired with row 5 of chain B and the CSV only means anything alongside the partners it was built with. Here the key is a taxonomy id and the pairing itself is left to Boltz. Both end up in the same Boltz code, which groups rows by key; they differ in what the key means and in who chose the groups.
+
+One consequence is worth knowing. When a species has several hits for the same chain — paralogs, or a duplicated domain — Boltz builds as many rows as the largest number of occurrences and cycles the shorter chain's hits to fill them (`idx = i % len(seq_idxs)` in `featurizerv2.py`, commented "roll over the sequence index to maximize diversity"). Species matching cannot say which copy of A binds which copy of B, so some of those pairings are arbitrary. Server-paired MSAs do not reach that path, because a row number occurs once per chain.
+
 ### Row order and limits
 
 1. The query.
@@ -203,7 +207,7 @@ Run on one RTX PRO 4500 Blackwell (32 GB) against the AlphaFast databases:
 | LILRB1 D1–D2 | 233 | 8,310 | 4,096 (capped) |
 | RIFIN | 151 | 296 | 282 |
 
-The search took 236 s for both sequences. A repeat `search_sequences` call with the same `cache_dir` returned instantly. The RIFIN MSA was identical in size to AlphaFast's. The LILRB1 MSA differs only by the keyed-row cap.
+The search took 236 s for both sequences. A repeat `search_sequences` call with the same `cache_dir` returned instantly. The RIFIN MSA came out the same size as AlphaFast's, and the LILRB1 one differs by the keyed-row cap. Note that this compares row *counts*, not row contents, and says nothing about the predictions: it is a sanity check that the search reaches the same depth, not evidence that the two produce the same alignment.
 
 ## Limitations
 
@@ -211,4 +215,6 @@ The search took 236 s for both sequences. A repeat `search_sequences` call with 
 - **No templates.** Template search is not included.
 - **GPU-oriented.** The padded databases are built for GPU search. `gpu=False` exists but has not been tested on them.
 - **Species pairing assumes co-evolution.** For complexes whose chains come from different organisms (for example, host–pathogen), few rows share a key. Compare runs with and without pairing.
+- **Pairing differs from `--use_msa_server`, and has not been benchmarked.** The key is a taxonomy id rather than a server-assigned row number, so paralogs within one species are paired arbitrarily (see [How pairing works](#how-pairing-works)). Which approach predicts complexes better is not known: it would take running both over a held-out set of known structures and comparing DockQ or ipTM, which has not been done. Expect single chains to behave the same way and complexes to differ.
+- **Row selection is not AF3's.** The search settings match AlphaFast's, but which hits become rows, in what order, and under which caps is this module's own choice, and AF3 pairs chains with its own code. Matching search settings does not make the alignment the model sees identical.
 - **Disk and memory.** The databases are about 390 GB. GPU search streams them from disk, so fast local storage (NVMe) helps a lot.
