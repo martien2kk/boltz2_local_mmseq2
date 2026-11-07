@@ -8,6 +8,7 @@ is set and mmseqs is on PATH.
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from boltz.data.msa.local_mmseqs import (
     check_setup,
     collect_sequences,
     read_fasta,
+    read_lookup,
     reduce_paired,
     reduce_unpaired,
     search_sequences,
@@ -196,6 +198,51 @@ def test_resource_options_reject_out_of_range_values(tmp_path, flag, value):
     result = local_msa_cli(tmp_path, flag, value)
     assert result.exit_code != 0
     assert "is not in the range" in result.output
+
+
+def test_lookup_maps_database_keys_back_to_query_positions(tmp_path):
+    # createdb --shuffle is on by default and reorders entries once there are
+    # more than about 32, so a key is not a position in the FASTA. unpackdb
+    # names its files by key, so reading one as the other hands every protein
+    # another protein's MSA. Any test with 32 or fewer sequences passes either
+    # way, which is why this one is deliberately larger.
+    shuffled = tmp_path / "shuffled.lookup"
+    n = 40
+    order = [(i, (i * 7) % n) for i in range(n)]  # a permutation, not identity
+    shuffled.write_text("".join(f"{k}\t{v}\t0\n" for k, v in order))
+
+    mapping = read_lookup(shuffled, n)
+    assert mapping != {i: i for i in range(n)}, "test data is not permuted"
+    assert sorted(mapping.values()) == list(range(n))
+    assert mapping[1] == 7
+
+    identity = tmp_path / "identity.lookup"
+    identity.write_text("".join(f"{i}\t{i}\t0\n" for i in range(n)))
+    assert read_lookup(identity, n) == {i: i for i in range(n)}
+
+
+def test_lookup_that_does_not_cover_the_queries_is_rejected(tmp_path):
+    path = tmp_path / "short.lookup"
+    path.write_text("0\t0\t0\n1\t1\t0\n")
+    with pytest.raises(RuntimeError, match="does not describe"):
+        read_lookup(path, 5)
+
+
+@pytest.mark.skipif(shutil.which("mmseqs") is None, reason="needs mmseqs on PATH")
+def test_createdb_key_order_matches_the_lookup(tmp_path):
+    # Pins the real behaviour: 40 sequences is past the point where createdb
+    # reorders, so this fails if the fork ever stops reading the lookup.
+    n = 40
+    fasta = tmp_path / "q.fasta"
+    fasta.write_text("".join(f">{i}\n{'A' * (20 + i)}\n" for i in range(n)))
+    db = tmp_path / "qdb"
+    subprocess.run(
+        ["mmseqs", "createdb", str(fasta), str(db), "--shuffle", "0"],
+        check=True, capture_output=True,
+    )  # fmt: skip
+
+    mapping = read_lookup(Path(f"{db}.lookup"), n)
+    assert sorted(mapping.values()) == list(range(n))
 
 
 def test_sequence_id_is_stable_and_distinct():

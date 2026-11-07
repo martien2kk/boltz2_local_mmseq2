@@ -473,8 +473,53 @@ def _gpu_search(  # noqa: PLR0913
     }
 
 
-def _postprocess(
-    mmseqs: str, query_db: Path, gpu_result: dict, paired: bool, limit: int
+def read_lookup(path: Path, n_queries: int) -> dict[int, int]:
+    """Map MMseqs2 database keys back to positions in the query FASTA.
+
+    createdb writes a .lookup of "key<TAB>name<TAB>file", where name is the
+    FASTA header. The fork writes each sequence's index as its header, so the
+    name is the position in the list that was searched. Key and position are
+    not the same: createdb's --shuffle, on by default, reorders entries once
+    there are more than about 32 of them, and unpackdb names its output files
+    by key. Taking one for the other gives every protein another protein's
+    MSA, silently, for any run of more than 32 unique sequences.
+
+    Parameters
+    ----------
+    path : Path
+        The .lookup file beside the query database.
+    n_queries : int
+        How many sequences were written to the FASTA.
+
+    Returns
+    -------
+    dict[int, int]
+        Database key -> index in the query list.
+
+    """
+    mapping: dict[int, int] = {}
+    for line in path.read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:  # noqa: PLR2004
+            continue
+        mapping[int(fields[0])] = int(fields[1])
+
+    if sorted(mapping.values()) != list(range(n_queries)):
+        msg = (
+            f"{path.name} does not describe the {n_queries} sequences that "
+            "were searched; MMseqs2 results cannot be matched to them."
+        )
+        raise RuntimeError(msg)
+    return mapping
+
+
+def _postprocess(  # noqa: PLR0913
+    mmseqs: str,
+    query_db: Path,
+    gpu_result: dict,
+    paired: bool,
+    limit: int,
+    key_to_index: dict[int, int],
 ) -> dict[int, list]:
     """Turn one database's search result into hits. Uses the CPU only, so it
     runs in a worker thread while the next database searches on the GPU.
@@ -517,7 +562,8 @@ def _postprocess(
     hits = {}
     for f in out.iterdir():
         # One file at a time, reduced before the next is read.
-        hits[int(f.name)] = reduce(read_fasta(f.read_text())[1:], limit)
+        # The file is named by database key, which is not the query's position.
+        hits[key_to_index[int(f.name)]] = reduce(read_fasta(f.read_text())[1:], limit)
 
     peak = directory_size(work)
     shutil.rmtree(work, ignore_errors=True)
@@ -603,7 +649,13 @@ def search_sequences(  # noqa: PLR0913
             fasta = work / "query.fasta"
             fasta.write_text("".join(f">{i}\n{s}\n" for i, s in enumerate(todo)))
             query_db = work / "queryDB"
-            _run([mmseqs, "createdb", str(fasta), str(query_db)])
+            # --shuffle defaults to 1, which reorders entries above about 32
+            # sequences, so a database key is not the position in the FASTA.
+            _run([mmseqs, "createdb", str(fasta), str(query_db), "--shuffle", "0"])
+            # Read the mapping back anyway rather than trusting the flag: the
+            # cost of being wrong here is every protein silently receiving
+            # another protein's MSA.
+            key_to_index = read_lookup(Path(f"{query_db}.lookup"), len(todo))
 
             # One task per database. A device is held only for the search, so
             # with one GPU the searches run one at a time and each database's
@@ -646,7 +698,9 @@ def search_sequences(  # noqa: PLR0913
                 paired = name == PAIRING_DATABASE
                 limit = max_paired_rows + 1 if paired else max_rows
                 with cpu_slots:
-                    return _postprocess(mmseqs, query_db, gpu_result, paired, limit)
+                    return _postprocess(
+                        mmseqs, query_db, gpu_result, paired, limit, key_to_index
+                    )
 
             logger.info(
                 "Searching %d database(s) over %d device(s), %d threads each",
