@@ -22,9 +22,11 @@ from boltz.data.msa.local_mmseqs import (
     build_rows,
     cached_msa_path,
     check_disk_space,
+    check_gpu_memory,
     checked_sequence,
     check_setup,
     collect_sequences,
+    gpu_memory,
     read_fasta,
     read_lookup,
     reduce_paired,
@@ -34,6 +36,7 @@ from boltz.data.msa.local_mmseqs import (
     visible_devices,
     write_csv,
 )
+from boltz.data.msa import local_mmseqs
 from boltz.data.parse.csv import parse_csv
 
 QUERY = "MKTAYIAKQR"
@@ -361,6 +364,74 @@ def test_disk_space_check_warns_but_does_not_raise(tmp_path, caplog):
     assert "free" in caplog.text
 
     check_disk_space(tmp_path / "does-not-exist", 1)
+
+
+def fake_gpu(free, total, others=()):
+    """Stand in for gpu_memory with a fixed reading."""
+    return lambda device: (free, total, list(others))
+
+
+def test_gpu_check_passes_on_an_idle_card(monkeypatch, caplog):
+    # A desktop session holding a few hundred MiB must not stop a search.
+    monkeypatch.delenv("BOLTZ_SKIP_GPU_CHECK", raising=False)
+    monkeypatch.setattr(local_mmseqs, "gpu_memory", fake_gpu(31391, 32623))
+    with caplog.at_level(logging.INFO):
+        check_gpu_memory(["0"])
+    assert "31391 of 32623" in caplog.text
+
+
+def test_gpu_check_refuses_a_card_another_search_is_using(monkeypatch):
+    # The failure this replaces was a bare CUDA OOM from inside libmarv,
+    # raised minutes in and naming neither the device nor the other process.
+    monkeypatch.delenv("BOLTZ_SKIP_GPU_CHECK", raising=False)
+    monkeypatch.setattr(
+        local_mmseqs,
+        "gpu_memory",
+        fake_gpu(2048, 32623, ["pid 4242 (mmseqs) holding 29000 MiB"]),
+    )
+    with pytest.raises(RuntimeError) as err:
+        check_gpu_memory(["0"])
+    message = str(err.value)
+    assert "GPU 0" in message
+    assert "2048 of 32623" in message
+    assert "pid 4242 (mmseqs)" in message
+    assert "BOLTZ_SKIP_GPU_CHECK" in message
+
+
+def test_gpu_check_can_be_turned_off(monkeypatch, caplog):
+    monkeypatch.setenv("BOLTZ_SKIP_GPU_CHECK", "1")
+    monkeypatch.setattr(local_mmseqs, "gpu_memory", fake_gpu(0, 32623))
+    with caplog.at_level(logging.WARNING):
+        check_gpu_memory(["0"])
+    assert "BOLTZ_SKIP_GPU_CHECK" in caplog.text
+
+    # An unset-looking value leaves the check on.
+    monkeypatch.setenv("BOLTZ_SKIP_GPU_CHECK", "0")
+    with pytest.raises(RuntimeError):
+        check_gpu_memory(["0"])
+
+
+def test_gpu_check_continues_when_nvidia_smi_cannot_be_read(monkeypatch, caplog):
+    # Advisory, not a gate: an unreadable card must not stop a run that
+    # would have worked.
+    monkeypatch.delenv("BOLTZ_SKIP_GPU_CHECK", raising=False)
+    monkeypatch.setattr(local_mmseqs, "gpu_memory", lambda device: None)
+    with caplog.at_level(logging.WARNING):
+        check_gpu_memory(["0"])
+    assert "nvidia-smi" in caplog.text
+
+
+def test_gpu_check_names_the_first_busy_device_of_several(monkeypatch):
+    readings = {"2": (31000, 32623, []), "3": (100, 32623, [])}
+    monkeypatch.delenv("BOLTZ_SKIP_GPU_CHECK", raising=False)
+    monkeypatch.setattr(local_mmseqs, "gpu_memory", lambda d: readings[d])
+    with pytest.raises(RuntimeError, match="GPU 3"):
+        check_gpu_memory(["2", "3"])
+
+
+def test_gpu_memory_returns_nothing_without_nvidia_smi(monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    assert gpu_memory("0") is None
 
 
 def test_written_csv_is_read_by_boltz(tmp_path):

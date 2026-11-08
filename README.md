@@ -42,6 +42,8 @@ boltz predict input_path --use_local_msa --mmseqs_db_dir /path/to/databases/mmse
 
 The script needs about 800 GB of free disk space while it runs. See [AlphaFast's database instructions](https://github.com/RomeroLab/alphafast#step-3-download-and-convert-databases) for options, including building the databases from source.
 
+**3. A GPU with room.** The prefilter streams a padded database through device memory and needs most of the card to itself, so two searches on one GPU — or a search alongside a loaded model — fail part-way with a `CUDA error: out of memory` from inside MMseqs2. Each device is checked with `nvidia-smi` before the search starts and one that is already in use is refused by name, naming the process holding it. A job scheduler's GPU allocation does not stop a process started outside it from sharing the card. Set `BOLTZ_SKIP_GPU_CHECK=1` to search anyway. See [Local MSA generation](src/boltz/data/msa/local_mmseqs.md#gpu-memory).
+
 **Third-party software and data.** This repository contains only Boltz and the local MSA code, under the MIT license. MMseqs2, the AlphaFast container and scripts, and the sequence databases are not included or redistributed here. Each is downloaded from its own source and has its own license and terms. Notably, AlphaFast is licensed [CC-BY-NC-SA 4.0](https://github.com/RomeroLab/alphafast/blob/main/LICENSE) (non-commercial), so check those terms before using its container or scripts for commercial work.
 
 ## Installing this fork

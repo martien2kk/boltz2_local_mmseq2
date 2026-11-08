@@ -146,6 +146,21 @@ boltz predict inputs/ --use_local_msa --msa_batch_size 200 --out_dir results/
 
 Reach for this last. Every group reads all four databases again, and a search streams its whole database off disk, so two groups cost close to two full searches. Groups do share one cache directory, so a sequence searched in an earlier group is not searched again in a later one.
 
+### GPU memory
+
+The prefilter streams a padded database through device memory, so a search needs most of the card to itself. Two searches on one GPU, or a search alongside a loaded model, make the prefilter fail with a bare `CUDA error: out of memory` from inside libmarv — minutes into the run, naming neither the device nor what else was on it.
+
+Before the first search, each device it will use is checked with `nvidia-smi`, and a device with less than 85% of its memory free is refused by name, along with the process holding it:
+
+```
+RuntimeError: GPU 0 has only 22937 of 32623 MiB free (70%). MMseqs2 streams a
+padded database through device memory and needs most of the card, so the search
+would likely die part-way with a CUDA out-of-memory error. In use by: pid 740595
+(python) holding 8446 MiB. ...
+```
+
+A desktop session holding a few hundred MiB is well inside the threshold. This is a snapshot, not a reservation: a process that starts just after the check can still take the memory, so a scheduler remains the only real guard. Set `BOLTZ_SKIP_GPU_CHECK=1` to search anyway, and note that a job scheduler's GPU allocation does not stop a process started outside it from sharing the card.
+
 ### Search settings
 
 | Setting | Value | Argument |

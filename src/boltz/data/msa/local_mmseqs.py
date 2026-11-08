@@ -50,6 +50,13 @@ SEARCH_ORDER = ("uniref90", "mgnify", "uniprot", "small_bfd")
 # logged at the end of a search, so a run tells you your own number.
 TMP_BYTES_PER_SEQUENCE = 250 * 1024**2
 
+# Fraction of a GPU's memory that must be free before a search starts. The
+# prefilter streams a padded database through device memory and needs most of
+# the card, so sharing one with another search or a loaded model makes it die
+# part-way. A desktop session holding a few hundred MiB is well inside this.
+# See check_gpu_memory.
+GPU_MIN_FREE_FRACTION = 0.85
+
 TAXON_ID = re.compile(r"\bOX=(\d+)")
 
 # Letters Boltz has a protein token for. A query sequence holding anything
@@ -429,6 +436,122 @@ def visible_devices(n_gpus: int) -> list[str]:
     return allocated[:n_gpus]
 
 
+def gpu_memory(device: str) -> Optional[tuple[int, int, list[str]]]:
+    """Report free memory and other compute processes on one CUDA device.
+
+    Read through nvidia-smi rather than a CUDA call so that asking the
+    question does not itself create a context on the device.
+
+    Parameters
+    ----------
+    device : str
+        Absolute CUDA device id, the form CUDA_VISIBLE_DEVICES uses.
+
+    Returns
+    -------
+    tuple[int, int, list[str]], optional
+        Free MiB, total MiB, and a description of every compute process on the
+        device other than this one. None when nvidia-smi cannot be read, which
+        is not an error: the check this feeds is advisory.
+
+    """
+
+    def ask(query: str) -> Optional[list[str]]:
+        cmd = [
+            "nvidia-smi",
+            f"--query-{query}",
+            "--format=csv,noheader,nounits",
+            "-i",
+            device,
+        ]
+        try:
+            proc = subprocess.run(  # noqa: S603
+                cmd, capture_output=True, text=True, check=False, timeout=30
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        return [line for line in proc.stdout.splitlines() if line.strip()]
+
+    reported = ask("gpu=memory.free,memory.total")
+    if not reported:
+        return None
+    try:
+        free, total = (int(v) for v in reported[0].split(",")[:2])
+    except ValueError:
+        return None
+
+    others = []
+    for line in ask("compute-apps=pid,process_name,used_memory") or []:
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) < 3:  # noqa: PLR2004
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        others.append(f"pid {pid} ({fields[1]}) holding {fields[2]} MiB")
+    return free, total, others
+
+
+def check_gpu_memory(devices: list[str]) -> None:
+    """Refuse to start a GPU search on a device that is already busy.
+
+    MMseqs2's prefilter streams a padded database through device memory and
+    needs most of the card. Sharing one with another search, or with a loaded
+    model, makes the prefilter die with a bare CUDA out-of-memory error from
+    inside libmarv that names neither the device nor what else was on it, and
+    only after the search has been running for a while. Checking first turns
+    that into something the user can act on.
+
+    This is a snapshot, not a reservation: a process starting right after the
+    check can still take the memory, and a scheduler is the only real guard.
+    Set BOLTZ_SKIP_GPU_CHECK=1 to search anyway.
+
+    Parameters
+    ----------
+    devices : list[str]
+        Absolute CUDA device ids the search will use.
+
+    Raises
+    ------
+    RuntimeError
+        If a device has less than GPU_MIN_FREE_FRACTION of its memory free.
+
+    """
+    if os.environ.get("BOLTZ_SKIP_GPU_CHECK", "").strip() not in ("", "0"):
+        logger.warning("BOLTZ_SKIP_GPU_CHECK is set; not checking GPU memory.")
+        return
+
+    for device in devices:
+        status = gpu_memory(device)
+        if status is None:
+            logger.warning(
+                "Could not read GPU %s from nvidia-smi; starting the search "
+                "without checking how much memory is free.", device,
+            )  # fmt: skip
+            continue
+        free, total, others = status
+        if total <= 0:
+            continue
+        if free >= total * GPU_MIN_FREE_FRACTION:
+            logger.info("GPU %s: %d of %d MiB free.", device, free, total)
+            continue
+        busy = "; ".join(others) if others else "no compute process reported"
+        msg = (
+            f"GPU {device} has only {free} of {total} MiB free "
+            f"({free / total:.0%}). MMseqs2 streams a padded database through "
+            f"device memory and needs most of the card, so the search would "
+            f"likely die part-way with a CUDA out-of-memory error. In use by: "
+            f"{busy}. Wait for that to finish, set CUDA_VISIBLE_DEVICES to a "
+            f"free device, or set BOLTZ_SKIP_GPU_CHECK=1 to search anyway."
+        )
+        raise RuntimeError(msg)
+
+
 def _gpu_search(  # noqa: PLR0913
     mmseqs: str,
     query_db: Path,
@@ -673,6 +796,8 @@ def search_sequences(  # noqa: PLR0913
                     n_gpus, len(SEARCH_ORDER), usable,
                 )  # fmt: skip
             devices = visible_devices(usable) if gpu else [None]
+            if gpu:
+                check_gpu_memory(devices)
             search_threads = max(1, threads // len(devices))
             free_devices = queue.Queue()
             for device in devices:
