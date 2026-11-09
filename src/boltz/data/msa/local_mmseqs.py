@@ -21,10 +21,12 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +59,16 @@ TMP_BYTES_PER_SEQUENCE = 250 * 1024**2
 # See check_gpu_memory.
 GPU_MIN_FREE_FRACTION = 0.85
 
+# How often a search that is still running says so. The searches are long --
+# over an hour for a few hundred sequences -- and MMseqs2's own output is
+# captured rather than printed, so without this the step looks like a hang.
+HEARTBEAT_SECONDS = 300.0
+
+# MSAs with fewer rows than this are reported separately at the end. A shallow
+# MSA is the usual reason a prediction comes out poorly, and it is better to
+# learn that from the search than from the structure.
+SHALLOW_MSA_ROWS = 10
+
 TAXON_ID = re.compile(r"\bOX=(\d+)")
 
 # Letters Boltz has a protein token for. A query sequence holding anything
@@ -65,6 +77,129 @@ TAXON_ID = re.compile(r"\bOX=(\d+)")
 # sequence this module silently altered would no longer be the one Boltz
 # folds. See checked_sequence.
 PROTEIN_LETTERS = frozenset(string.ascii_uppercase)
+
+
+def log_to_stdout(level: int = logging.INFO) -> None:
+    """Send this package's log messages to stdout.
+
+    Boltz configures no logging at all, so by default every logger.info in
+    this module is discarded and the MSA step prints nothing between "unique
+    protein sequence(s) to search" and the start of prediction -- over an hour
+    of silence on a few hundred sequences. The handler goes on the boltz
+    logger rather than the root one, so turning these messages on does not
+    also turn on INFO from torch, lightning and urllib3.
+
+    This moves warnings from this package to stdout. Without a handler they
+    reached stderr through logging.lastResort, so under a scheduler they
+    landed in the error file; now they sit next to the progress they refer
+    to. Propagation is turned off so that a handler another library adds to
+    the root logger later cannot print every line a second time.
+
+    Parameters
+    ----------
+    level : int
+        Lowest level to show. logging.DEBUG also reports every MMseqs2
+        command as it is run.
+
+    """
+    package = logging.getLogger("boltz")
+    package.setLevel(level)
+    # Called once per run, but a second call must not double every line.
+    if not any(getattr(h, "_boltz_msa_handler", False) for h in package.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._boltz_msa_handler = True  # noqa: SLF001
+        package.addHandler(handler)
+    package.propagate = False
+
+
+def elapsed(seconds: float) -> str:
+    """Format a duration for the log, in whichever unit reads best."""
+    if seconds < 90:  # noqa: PLR2004
+        return f"{seconds:.1f} s"
+    if seconds < 5400:  # noqa: PLR2004
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.2f} h"
+
+
+@contextmanager
+def heartbeat(what: str, interval: Optional[float] = None):
+    """Report that a long step is still running, every `interval` seconds.
+
+    MMseqs2's own progress goes to a pipe that is only read on failure, so a
+    search in progress is otherwise indistinguishable from a hung one. The
+    thread is a daemon and only logs, so it cannot hold up the search or stop
+    the process exiting.
+
+    Parameters
+    ----------
+    what : str
+        What is running, named as the log line should read.
+    interval : float, optional
+        Seconds between messages. Non-positive turns the heartbeat off. None
+        reads HEARTBEAT_SECONDS at call time, so setting that module constant
+        takes effect; a default argument would have frozen its value at import
+        and quietly ignored any change.
+
+    """
+    if interval is None:
+        interval = HEARTBEAT_SECONDS
+    if interval <= 0:
+        yield
+        return
+    stop = threading.Event()
+    start = time.time()
+
+    def tick() -> None:
+        while not stop.wait(interval):
+            logger.info("  %s: still running after %s", what, elapsed(time.time() - start))
+
+    thread = threading.Thread(target=tick, daemon=True, name="boltz-msa-heartbeat")
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
+def describe_hits(hits: dict[int, list]) -> str:
+    """Summarise how many hits each query got, for one database.
+
+    Reports the median rather than the mean: hit counts are capped per
+    database, so a handful of queries at the cap pull a mean away from what a
+    typical query actually got.
+    """
+    counts = sorted(len(v) for v in hits.values())
+    if not counts:
+        return "no queries"
+    median = counts[len(counts) // 2]
+    empty = sum(1 for c in counts if c == 0)
+    text = f"{sum(counts)} hits kept, median {median}/query, range {counts[0]}-{counts[-1]}"
+    if empty:
+        plural = "y" if empty == 1 else "ies"
+        text += f", {empty} quer{plural} with none"
+    return text
+
+
+def describe_depths(depths: list[int]) -> str:
+    """Summarise the depth of the MSAs a run wrote.
+
+    A shallow MSA is the usual reason a prediction comes out poorly, so the
+    count of them is worth having in the log next to the timings.
+    """
+    if not depths:
+        return "no MSAs written"
+    ordered = sorted(depths)
+    median = ordered[len(ordered) // 2]
+    shallow = sum(1 for d in ordered if d < SHALLOW_MSA_ROWS)
+    text = f"median {median} rows, range {ordered[0]}-{ordered[-1]}"
+    if shallow:
+        text += (
+            f"; {shallow} of {len(ordered)} below {SHALLOW_MSA_ROWS} rows, "
+            "which usually predicts poorly"
+        )
+    return text
 
 
 def checked_sequence(sequence: str, path: Path) -> str:
@@ -398,6 +533,7 @@ def _run(cmd: list[str], device: Optional[str] = None) -> None:
     env = None
     if device is not None:
         env = {**os.environ, "CUDA_VISIBLE_DEVICES": device}
+    logger.debug("running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)  # noqa: S603
     if proc.returncode != 0:
         msg = f"{' '.join(cmd[:2])} failed:\n{proc.stderr[-2000:]}{proc.stdout[-2000:]}"
@@ -585,8 +721,15 @@ def _gpu_search(  # noqa: PLR0913
     if gpu:
         search += ["--gpu", "1"]
 
+    where = f" on GPU {device}" if device is not None else " on CPU"
+    logger.info(
+        "%s: searching%s, up to %d hits per query, %d threads",
+        target_db.name, where, max_hits, threads,
+    )  # fmt: skip
     start = time.time()
-    _run(search, device=device)
+    with heartbeat(f"{target_db.name} search"):
+        _run(search, device=device)
+    logger.info("%s: search done in %s", target_db.name, elapsed(time.time() - start))
     return {
         "result": result,
         "target_db": target_db,
@@ -677,9 +820,12 @@ def _postprocess(  # noqa: PLR0913
     msa, out = work / "msa", work / "out"
 
     start = time.time()
-    _run([mmseqs, "result2msa", str(query_db), str(target_db), str(result), str(msa),
-          "--msa-format-mode", "2"])  # fmt: skip
-    _run([mmseqs, "unpackdb", str(msa), str(out), "--unpack-name-mode", "0"])
+    logger.info("%s: building alignments from the search result", target_db.name)
+    with heartbeat(f"{target_db.name} result2msa"):
+        _run([mmseqs, "result2msa", str(query_db), str(target_db), str(result), str(msa),
+              "--msa-format-mode", "2"])  # fmt: skip
+    with heartbeat(f"{target_db.name} unpackdb"):
+        _run([mmseqs, "unpackdb", str(msa), str(out), "--unpack-name-mode", "0"])
 
     reduce = reduce_paired if paired else reduce_unpaired
     hits = {}
@@ -693,13 +839,14 @@ def _postprocess(  # noqa: PLR0913
 
     device = gpu_result["device"]
     logger.info(
-        "%s%s: %.1f s search, %.1f s post-processing, %.2f GiB intermediates",
+        "%s%s: %s search, %s post-processing, %.2f GiB intermediates",
         target_db.name,
         f" (GPU {device})" if device is not None else "",
-        gpu_result["search_time"],
-        time.time() - start,
+        elapsed(gpu_result["search_time"]),
+        elapsed(time.time() - start),
         peak / 1024**3,
     )
+    logger.info("%s: %s", target_db.name, describe_hits(hits))
     return hits
 
 
@@ -764,7 +911,13 @@ def search_sequences(  # noqa: PLR0913
         mmseqs = check_setup(db_dir, mmseqs)
         threads = threads or len(os.sched_getaffinity(0))
         start = time.time()
-        logger.info("Searching %d sequence(s) with MMseqs2", len(todo))
+        lengths = sorted(len(s) for s in todo)
+        cached = len(dict.fromkeys(sequences)) - len(todo)
+        logger.info(
+            "Searching %d sequence(s) with MMseqs2: %d-%d residues, median %d%s",
+            len(todo), lengths[0], lengths[-1], lengths[len(lengths) // 2],
+            f" ({cached} already cached)" if cached else "",
+        )  # fmt: skip
         check_disk_space(tmp_dir, len(todo))
 
         with tempfile.TemporaryDirectory(prefix="boltz_mmseqs_", dir=tmp_dir) as tmp:
@@ -828,8 +981,10 @@ def search_sequences(  # noqa: PLR0913
                     )
 
             logger.info(
-                "Searching %d database(s) over %d device(s), %d threads each",
-                len(SEARCH_ORDER), len(devices), search_threads,
+                "Searching %d database(s) (%s) over %d device(s), %d threads "
+                "each; progress is reported every %.0f s while a step runs",
+                len(SEARCH_ORDER), ", ".join(SEARCH_ORDER), len(devices),
+                search_threads, HEARTBEAT_SECONDS,
             )  # fmt: skip
             with ThreadPoolExecutor(max_workers=len(SEARCH_ORDER)) as executor:
                 pending = {n: executor.submit(one_database, n) for n in SEARCH_ORDER}
@@ -865,12 +1020,27 @@ def search_sequences(  # noqa: PLR0913
                     unpaired[i].extend(hits)
             paired = results[PAIRING_DATABASE]
 
+            logger.info("Writing %d MSA CSV(s) to %s", len(todo), cache_dir)
+            depths = []
+            written = 0
             for i, seq in enumerate(todo):
                 rows = build_rows(
                     seq, paired.get(i, []), unpaired[i], max_paired_rows, max_rows
                 )
-                write_csv(cached_msa_path(cache_dir, seq), rows)
+                path = cached_msa_path(cache_dir, seq)
+                write_csv(path, rows)
+                depths.append(len(rows))
+                written += path.stat().st_size
+            # Depth is what decides whether a prediction has anything to go
+            # on, so report it next to the timings rather than leaving it to
+            # be discovered from the structures.
+            logger.info("MSA depth: %s", describe_depths(depths))
+            logger.info("Wrote %.1f MiB of MSA CSVs", written / 1024**2)
 
-        logger.info("MMseqs2 search finished in %.1f s", time.time() - start)
+        total = time.time() - start
+        logger.info(
+            "MMseqs2 search finished in %s (%.1f s per sequence)",
+            elapsed(total), total / max(1, len(todo)),
+        )  # fmt: skip
 
     return {s: cached_msa_path(cache_dir, s) for s in sequences}

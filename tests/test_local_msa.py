@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,12 @@ from boltz.data.msa.local_mmseqs import (
     checked_sequence,
     check_setup,
     collect_sequences,
+    describe_depths,
+    describe_hits,
+    elapsed,
     gpu_memory,
+    heartbeat,
+    log_to_stdout,
     read_fasta,
     read_lookup,
     reduce_paired,
@@ -177,6 +183,20 @@ def test_rejects_a_paired_cap_that_would_crowd_out_unpaired_rows(tmp_path):
         tmp_path, "--max_msa_seqs", "1024", "--max_paired_msa_rows", "512"
     )
     assert "must be below" not in result.output
+
+
+def test_log_level_option_sets_the_heartbeat(tmp_path):
+    # The option has to reach the module constant: the interval used to be a
+    # default argument frozen at import, where setting it did nothing.
+    for level, expected in (("quiet", 0.0), ("normal", 300.0), ("debug", 60.0)):
+        local_mmseqs.HEARTBEAT_SECONDS = -1.0
+        local_msa_cli(tmp_path, "--msa_log_level", level)
+        assert local_mmseqs.HEARTBEAT_SECONDS == expected, level
+    local_mmseqs.HEARTBEAT_SECONDS = 300.0
+
+    result = local_msa_cli(tmp_path, "--msa_log_level", "nonsense")
+    assert result.exit_code != 0
+    assert "nonsense" in result.output
 
 
 def test_warns_when_keyed_rows_take_most_of_the_window(tmp_path):
@@ -427,6 +447,125 @@ def test_gpu_check_names_the_first_busy_device_of_several(monkeypatch):
     monkeypatch.setattr(local_mmseqs, "gpu_memory", lambda d: readings[d])
     with pytest.raises(RuntimeError, match="GPU 3"):
         check_gpu_memory(["2", "3"])
+
+
+def test_log_messages_reach_stdout(capsys):
+    # Boltz configures no logging, so without this the whole MSA step is
+    # silent: the messages are emitted and discarded.
+    package = logging.getLogger("boltz")
+    before = list(package.handlers)
+    try:
+        package.handlers = []
+        logging.getLogger("boltz.data.msa.local_mmseqs").info("hello")
+        assert "hello" not in capsys.readouterr().out
+
+        log_to_stdout(logging.INFO)
+        logging.getLogger("boltz.data.msa.local_mmseqs").info("hello")
+        assert "hello" in capsys.readouterr().out
+
+        # Called twice, every line must still appear exactly once.
+        log_to_stdout(logging.INFO)
+        logging.getLogger("boltz.data.msa.local_mmseqs").info("once")
+        assert capsys.readouterr().out.count("once") == 1
+    finally:
+        package.handlers = before
+        package.propagate = True
+
+
+def test_log_setup_leaves_other_packages_alone():
+    # Turning on INFO for the MSA step must not turn on INFO for torch,
+    # lightning and urllib3, which is what basicConfig would have done.
+    # Checked on the root logger, not on torch's: under pytest every logger
+    # carries pytest's own capture handlers, so counting those proves nothing.
+    root = logging.getLogger()
+    package = logging.getLogger("boltz")
+    root_level, root_handlers = root.level, list(root.handlers)
+    before, level = list(package.handlers), package.level
+    try:
+        log_to_stdout(logging.INFO)
+        assert root.level == root_level, "root logger level was changed"
+        assert list(root.handlers) == root_handlers, "handler added to root"
+        assert any(
+            getattr(h, "_boltz_msa_handler", False) for h in package.handlers
+        ), "handler was not added to the boltz logger"
+    finally:
+        package.handlers, package.propagate = before, True
+        package.setLevel(level)
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [(0.5, "0.5 s"), (89, "89.0 s"), (90, "1.5 min"), (3600, "60.0 min"),
+     (5400, "1.50 h")],
+)
+def test_elapsed_switches_unit(seconds, expected):
+    assert elapsed(seconds) == expected
+
+
+def test_describe_hits_reports_the_median_not_the_mean():
+    # Counts are capped per database, so queries sitting at the cap would
+    # drag a mean away from what a typical query got.
+    hits = {0: [1] * 2, 1: [1] * 3, 2: [1] * 10000}
+    summary = describe_hits(hits)
+    assert "median 3/query" in summary
+    assert "range 2-10000" in summary
+    assert "10005 hits kept" in summary
+
+
+def test_describe_hits_counts_queries_with_nothing():
+    assert "1 query with none" in describe_hits({0: [], 1: [1]})
+    assert "2 queries with none" in describe_hits({0: [], 1: [], 2: [1]})
+    assert describe_hits({}) == "no queries"
+
+
+def test_describe_depths_flags_shallow_msas():
+    summary = describe_depths([1, 2, 500, 4096])
+    assert "median 500 rows" in summary
+    assert "range 1-4096" in summary
+    assert "2 of 4 below 10 rows" in summary
+
+    assert "below" not in describe_depths([50, 500])
+    assert describe_depths([]) == "no MSAs written"
+
+
+def test_heartbeat_reports_while_a_step_runs(caplog):
+    with caplog.at_level(logging.INFO, logger="boltz.data.msa.local_mmseqs"):
+        with heartbeat("uniref90 search", interval=0.05):
+            time.sleep(0.3)
+    assert "still running after" in caplog.text
+    assert "uniref90 search" in caplog.text
+
+
+def test_heartbeat_stops_when_the_step_finishes(caplog):
+    with heartbeat("x", interval=0.05):
+        pass
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="boltz.data.msa.local_mmseqs"):
+        time.sleep(0.3)
+    assert "still running" not in caplog.text
+
+
+def test_heartbeat_interval_is_read_at_call_time(monkeypatch, caplog):
+    # A default argument would freeze HEARTBEAT_SECONDS at import, so setting
+    # it would silently do nothing -- which is exactly what happened.
+    monkeypatch.setattr(local_mmseqs, "HEARTBEAT_SECONDS", 0.05)
+    with caplog.at_level(logging.INFO, logger="boltz.data.msa.local_mmseqs"):
+        with heartbeat("uniref90 search"):
+            time.sleep(0.3)
+    assert "still running after" in caplog.text
+
+
+def test_heartbeat_can_be_switched_off(caplog):
+    with caplog.at_level(logging.INFO, logger="boltz.data.msa.local_mmseqs"):
+        with heartbeat("x", interval=0):
+            time.sleep(0.15)
+    assert "still running" not in caplog.text
+
+
+def test_heartbeat_does_not_swallow_an_error():
+    with pytest.raises(ValueError, match="boom"):
+        with heartbeat("x", interval=0.05):
+            raise ValueError("boom")
 
 
 def test_gpu_memory_returns_nothing_without_nvidia_smi(monkeypatch):

@@ -1,3 +1,4 @@
+import logging
 import multiprocessing
 import os
 import pickle
@@ -25,8 +26,10 @@ from boltz.data import const
 from boltz.data.module.inference import BoltzInferenceDataModule
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.mol import load_canonicals
+from boltz.data.msa import local_mmseqs
 from boltz.data.msa.local_mmseqs import (
     collect_sequences,
+    log_to_stdout,
     search_sequences,
 )
 from boltz.data.msa.mmseqs2 import run_mmseqs2
@@ -1095,6 +1098,18 @@ def cli() -> None:
     default=4096,
 )
 @click.option(
+    "--msa_log_level",
+    type=click.Choice(["quiet", "normal", "debug"], case_sensitive=False),
+    default="normal",
+    help=(
+        "How much the local MSA step reports. normal names each database as "
+        "it is searched, says every few minutes that a long step is still "
+        "running, and summarises hits and MSA depth; debug adds every MMseqs2 "
+        "command; quiet reports warnings only. Used only if --use_local_msa "
+        "is set. Default is normal."
+    ),
+)
+@click.option(
     "--use_potentials",
     is_flag=True,
     help="Whether to use potentials for steering. Default is False.",
@@ -1204,6 +1219,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     msa_batch_size: Optional[int] = None,
     mmseqs_tmp_dir: Optional[str] = None,
     max_paired_msa_rows: int = 4096,
+    msa_log_level: str = "normal",
     use_potentials: bool = False,
     model: Literal["boltz1", "boltz2"] = "boltz2",
     method: Optional[str] = None,
@@ -1301,6 +1317,22 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "n_gpus": msa_gpus,
             "tmp_dir": Path(mmseqs_tmp_dir).expanduser() if mmseqs_tmp_dir else None,
         }
+        # Boltz sets up no logging, so without this the MSA step prints
+        # nothing at all while it runs -- over an hour on a few hundred
+        # sequences, indistinguishable from a hang.
+        level = msa_log_level.lower()
+        log_to_stdout(
+            {
+                "quiet": logging.WARNING,
+                "normal": logging.INFO,
+                "debug": logging.DEBUG,
+            }[level]
+        )
+        # How often a search in progress says so, rather than a separate
+        # option: it is the same question as how chatty the step should be.
+        local_mmseqs.HEARTBEAT_SECONDS = {
+            "quiet": 0.0, "normal": 300.0, "debug": 60.0,
+        }[level]  # fmt: skip
         click.echo(f"Local MSA generation enabled: {local_msa['db_dir']}")
 
     # Create output directories

@@ -146,6 +146,51 @@ boltz predict inputs/ --use_local_msa --msa_batch_size 200 --out_dir results/
 
 Reach for this last. Every group reads all four databases again, and a search streams its whole database off disk, so two groups cost close to two full searches. Groups do share one cache directory, so a sequence searched in an earlier group is not searched again in a later one.
 
+### Reading the log
+
+Boltz configures no logging of its own, so by default nothing this module logs reaches the terminal: a run would print `149 unique protein sequence(s) to search` and then say nothing for over an hour. The local MSA path installs a handler on the `boltz` logger — not the root one, so it does not also turn on `INFO` from torch, lightning and urllib3 — and writes to stdout, alongside the rest of the progress output.
+
+```
+Searching 5 sequence(s) with MMseqs2: 324-438 residues, median 372
+Temporary directory /tmp: 1721.5 GiB free, about 1.2 GiB estimated.
+GPU 0: 31391 of 32623 MiB free.
+Searching 4 database(s) (uniref90, mgnify, uniprot, small_bfd) over 1 device(s), 48 threads each
+uniref90_padded: searching on GPU 0, up to 10000 hits per query, 48 threads
+uniref90_padded: search done in 56.7 s
+uniref90_padded: building alignments from the search result
+mgnify_padded: searching on GPU 0, up to 5000 hits per query, 48 threads
+uniref90_padded (GPU 0): 56.7 s search, 41.7 s post-processing, 0.02 GiB intermediates
+uniref90_padded: 19615 hits kept, median 3028/query, range 2975-7551
+...
+MSA depth: median 3652 rows, range 3594-9978
+Wrote 9.4 MiB of MSA CSVs
+MMseqs2 search finished in 5.9 min (70.7 s per sequence)
+```
+
+Lines from different databases interleave because post-processing overlaps the next search — above, UniRef90's alignments are built while MGnify searches. That is the pipelining working, not a bug.
+
+Two of these lines are worth more than the timings:
+
+- **hits per query**, reported as a median rather than a mean, since the per-database cap parks some queries at the limit and drags a mean away from what a typical query got. A database returning nothing shows up here rather than in the structures.
+- **MSA depth**, with a count of MSAs below 10 rows. A shallow MSA is the usual reason a prediction comes out poorly, so it belongs in the log next to the timings.
+
+Warnings from the local MSA code move to stdout along with the rest. Before, with no handler anywhere, they reached stderr through `logging.lastResort`, so under a scheduler they landed in the job's error file rather than beside the progress they describe.
+
+`--msa_log_level` sets how much of this appears:
+
+| Level | Output | Heartbeat |
+|---|---|---|
+| `quiet` | warnings and errors only | off |
+| `normal` (default) | everything above | every 5 min |
+| `debug` | adds every MMseqs2 command as it runs | every 1 min |
+
+The heartbeat matters because MMseqs2's own progress goes to a pipe that is only read if the command fails, so a search in progress is otherwise indistinguishable from a hung one:
+
+```
+  mgnify_padded search: still running after 5.0 min
+  mgnify_padded search: still running after 10.0 min
+```
+
 ### GPU memory
 
 The prefilter streams a padded database through device memory, so a search needs most of the card to itself. Two searches on one GPU, or a search alongside a loaded model, make the prefilter fail with a bare `CUDA error: out of memory` from inside libmarv — minutes into the run, naming neither the device nor what else was on it.
